@@ -1,0 +1,5 @@
+use.external_contract::amm_contract
+
+begin
+    call.amm_contract::get_amount_y_out
+end

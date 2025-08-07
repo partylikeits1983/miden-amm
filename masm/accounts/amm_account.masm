@@ -1,0 +1,7 @@
+use.miden::account
+use.std::sys
+
+# => [x, y, dx]
+export.get_amount_y_out
+    push.1
+end
