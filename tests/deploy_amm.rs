@@ -3,15 +3,15 @@ use rand::RngCore;
 use std::{fs, path::Path, sync::Arc};
 
 use miden_assembly::{
-    ast::{Module, ModuleKind},
     LibraryPath,
+    ast::{Module, ModuleKind},
 };
 use miden_client::{
+    ClientError, Felt,
     account::{AccountBuilder, AccountStorageMode, AccountType, StorageSlot},
     builder::ClientBuilder,
     rpc::{Endpoint, TonicRpcClient},
     transaction::{TransactionKernel, TransactionRequestBuilder, TransactionScript},
-    ClientError, Felt,
 };
 use miden_objects::{
     account::{AccountComponent, NetworkId},

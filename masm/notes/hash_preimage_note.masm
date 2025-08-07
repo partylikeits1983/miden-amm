@@ -1,7 +1,8 @@
-use.miden::note
 use.miden::contracts::wallets::basic->wallet
+use.miden::note
 
 # => [HASH_PREIMAGE_SECRET]
+
 begin
 
     # Hashing the secret number

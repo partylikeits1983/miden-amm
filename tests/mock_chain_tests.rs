@@ -1,19 +1,20 @@
+use std::{fs, path::Path};
+
+use miden_amm::common::{create_amm_account, create_amm_input_note, create_library};
 use miden_client::{
-    account::AccountId,
     asset::{Asset, FungibleAsset},
     note::NoteType,
     testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
-    Word,
 };
 // use miden_clob::{create_partial_swap_note, try_match_swapp_notes};
-use miden_testing::{Auth, MockChain};
+use miden_testing::{Auth, MockChain, TransactionContextBuilder};
 
 use miden_objects::{
     testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2, transaction::OutputNote,
 };
 
 #[test]
-fn p2id_script_multiple_assets() {
+fn p2id_script_multiple_assets() -> anyhow::Result<()> {
     let mut mock_chain = MockChain::new();
 
     // Create assets
@@ -28,7 +29,7 @@ fn p2id_script_multiple_assets() {
     let target_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
 
     // Create the note
-    let note = mock_chain
+    let _note = mock_chain
         .add_pending_p2id_note(
             sender_account.id(),
             target_account.id(),
@@ -37,116 +38,66 @@ fn p2id_script_multiple_assets() {
         )
         .unwrap();
 
-    mock_chain.prove_next_block();
+    mock_chain.prove_next_block()?;
 
-    println!("p2id script hash: {:?}", note.script().root());
+    Ok(())
 }
 
 #[tokio::test]
-async fn swapp_match_mock_chain() -> anyhow::Result<()> {
+async fn amm_test() -> anyhow::Result<()> {
     let mut mock_chain = MockChain::new();
     mock_chain.prove_until_block(1u32)?;
 
     // Initialize assets & accounts
-    let asset_a: Asset =
+    let _asset_a: Asset =
         FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(), 100)
             .unwrap()
             .into();
-    let asset_b: Asset =
+    let _asset_b: Asset =
         FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap(), 100)
             .unwrap()
             .into();
 
     // Create sender and target and malicious account
     let alice_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
-    let bob_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
-    let matcher_account =
-        mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![asset_a, asset_b]);
+    let _bob_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
 
-    // SWAPP NOTE 1
-    let swap_note_1_asset_a: Asset =
-        FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(), 100)
-            .unwrap()
-            .into();
-    let swap_note_1_asset_b: Asset =
-        FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(), 100)
-            .unwrap()
-            .into();
+    mock_chain.add_pending_account(alice_account.clone());
 
-    let swap_note_1 = create_partial_swap_note(
-        alice_account.id(),         // creator of the order
-        alice_account.id(),         // last account to "fill the order"
-        swap_note_1_asset_a.into(), // offered asset (selling)
-        swap_note_1_asset_b.into(), // requested asset (buying)
-        Word::default(),            // serial number of the order
-        0,                          // fill number (0 means hasn't been filled)
-    )
-    .unwrap();
+    // Load the MASM file for the counter contract
+    let counter_path = Path::new("masm/accounts/amm_account.masm");
+    let counter_code = fs::read_to_string(counter_path).unwrap();
 
-    // SWAPP NOTE 2
-    let swap_note_2_asset_a: Asset =
-        FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(), 100)
-            .unwrap()
-            .into();
-    let swap_note_2_asset_b: Asset =
-        FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(), 100)
-            .unwrap()
-            .into();
+    let (amm_account, account_seed) = create_amm_account(&counter_code).await?;
 
-    let swap_note_2 = create_partial_swap_note(
-        bob_account.id(),           // creator of the order
-        bob_account.id(),           // last account to "fill the order"
-        swap_note_2_asset_b.into(), // offered asset (selling)
-        swap_note_2_asset_a.into(), // requested asset (buying)
-        Word::default(),            // serial number of the order
-        0,                          // fill number (0 means hasn't been filled)
-    )
-    .unwrap();
-
-    let swapp_note1_output = OutputNote::Full(swap_note_1.clone());
-    let swapp_note2_output = OutputNote::Full(swap_note_2.clone());
-
-    mock_chain.add_pending_note(swapp_note1_output);
-    mock_chain.add_pending_note(swapp_note2_output);
+    mock_chain.add_pending_account(amm_account.clone());
     mock_chain.prove_next_block()?;
 
-    let swap_data = try_match_swapp_notes(&swap_note_1, &swap_note_2, matcher_account.id())
-        .unwrap()
-        .expect("orders should cross");
+    let note_code = fs::read_to_string(Path::new("masm/notes/amm_input_note.masm")).unwrap();
+    let account_code = fs::read_to_string(Path::new("masm/accounts/amm_account.masm")).unwrap();
 
-    println!("built notes, executing tx");
+    let library_path = "external_contract::amm_contract";
+    let library = create_library(account_code, library_path).unwrap();
 
-    let mut outputs = vec![
-        OutputNote::Full(swap_data.p2id_from_2_to_1),
-        OutputNote::Full(swap_data.p2id_from_1_to_2),
-    ];
+    let amm_input_note = create_amm_input_note(note_code, library, alice_account, amm_account.id())
+        .await
+        .unwrap();
 
-    if let Some(ref note) = swap_data.leftover_swapp_note {
-        outputs.push(OutputNote::Full(note.clone()));
-    }
-    // CONSTRUCT AND EXECUTE TX (Success - Target Account)
-    let executed_transaction_1 = mock_chain
-        .build_tx_context(
-            matcher_account.id(),
-            &[swap_note_1.id(), swap_note_2.id()],
-            &[],
-        )?
-        .extend_expected_output_notes(outputs)
-        .build()?
-        .execute()
-        .await?;
+    mock_chain.add_pending_note(OutputNote::Full(amm_input_note.clone()));
+    mock_chain.prove_next_block()?;
 
-    let target_account = mock_chain.add_pending_executed_transaction(&executed_transaction_1)?;
+    let tx_inputs = mock_chain.get_transaction_inputs(
+        amm_account.clone(),
+        Some(account_seed),
+        &[amm_input_note.id()],
+        &[],
+    )?;
+    let tx_context = TransactionContextBuilder::new(amm_account.clone())
+        .tx_inputs(tx_inputs)
+        .build()?;
+    let executed_transaction = tx_context.execute().await?;
 
-    println!(
-        "asset a: {:?} asset b: {:?}",
-        target_account
-            .vault()
-            .get_balance(AccountId::try_from(asset_a.unwrap_fungible().faucet_id())?),
-        target_account
-            .vault()
-            .get_balance(AccountId::try_from(asset_b.unwrap_fungible().faucet_id())?)
-    );
+    let _target_account = mock_chain.add_pending_executed_transaction(&executed_transaction)?;
 
     Ok(())
 }

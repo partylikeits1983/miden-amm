@@ -1,7 +1,52 @@
 use.miden::account
+use.std::math::u64
 use.std::sys
 
-# => [x, y, dx]
+# CONSTANTS
+# =================================================================================================
+const.MAX_U32=0x0000000100000000
+
+# Memory Addresses for AMM calculations
+const.POOL_X = 0x0040
+const.POOL_Y = 0x0041
+const.DX_IN = 0x0042
+
+# AMM CALCULATION
+# =================================================================================================
+
+#! Calculates the amount of asset Y to return given input of asset X
+#! Formula: dy = (dx * y) / (dx + x)
+#!
+#! Inputs: [x, y, dx]
+#! Outputs: [dy]
+#!
 export.get_amount_y_out
-    push.1
+    # Store inputs in memory for easier manipulation
+    mem_store.DX_IN     # dx -> memory
+    mem_store.POOL_Y    # y -> memory
+    mem_store.POOL_X    # x -> memory
+
+    # Calculate numerator: dx * y
+    mem_load.DX_IN
+    u32split            # Convert to u64 format [dx_hi, dx_lo]
+
+    mem_load.POOL_Y
+    u32split            # Convert to u64 format [y_hi, y_lo, dx_hi, dx_lo]
+
+    exec.u64::wrapping_mul  # dx * y -> [numerator_hi, numerator_lo]
+
+    # Calculate denominator: dx + x
+    mem_load.DX_IN
+    mem_load.POOL_X
+    add                 # dx + x -> [denominator, numerator_hi, numerator_lo]
+
+    u32split            # Convert denominator to u64 format [denom_hi, denom_lo, numerator_hi, numerator_lo]
+
+    # Perform division: (dx * y) / (dx + x)
+    exec.u64::div       # [result_hi, result_lo]
+
+    # Convert back to single u32 (assuming result fits in u32)
+    push.MAX_U32 mul add
+
+    drop
 end

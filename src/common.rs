@@ -1,47 +1,30 @@
 use miden_assembly::{
+    Assembler, DefaultSourceManager, Library, LibraryPath,
     ast::{Module, ModuleKind},
-    Assembler, DefaultSourceManager, LibraryPath,
 };
-use rand::{rngs::StdRng, RngCore};
-use std::{env, fmt, fs, path::PathBuf, sync::Arc};
-use tokio::time::{sleep, Duration};
+use miden_lib::account::auth;
+use rand::{RngCore, rngs::StdRng};
+use std::sync::Arc;
+use tokio::time::{Duration, sleep};
 
 use miden_client::{
+    Client, ClientError, Felt, Word,
     account::{
-        component::{BasicFungibleFaucet, BasicWallet, RpoFalcon512},
         Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageSlot,
+        component::{BasicFungibleFaucet, BasicWallet, RpoFalcon512},
     },
-    asset::{Asset, FungibleAsset, TokenSymbol},
+    asset::{FungibleAsset, TokenSymbol},
     auth::AuthSecretKey,
-    builder::ClientBuilder,
-    crypto::{FeltRng, SecretKey},
+    crypto::SecretKey,
     keystore::FilesystemKeyStore,
     note::{
-        build_swap_tag, Note, NoteAssets, NoteExecutionHint, NoteId, NoteInputs, NoteMetadata,
-        NoteRecipient, NoteRelevance, NoteScript, NoteTag, NoteType,
+        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteScript,
+        NoteTag, NoteType,
     },
-    rpc::{Endpoint, TonicRpcClient},
-    store::InputNoteRecord,
     transaction::{OutputNote, TransactionKernel, TransactionRequestBuilder},
-    Client, ClientError, Felt, Word,
 };
-use miden_objects::{account::AccountComponent, Hasher, NoteError};
+use miden_objects::account::AccountComponent;
 use serde::de::value::Error;
-
-pub fn create_library(
-    assembler: Assembler,
-    library_path: &str,
-    source_code: &str,
-) -> Result<miden_assembly::Library, Box<dyn std::error::Error>> {
-    let source_manager = Arc::new(DefaultSourceManager::default());
-    let module = Module::parser(ModuleKind::Library).parse_str(
-        LibraryPath::new(library_path)?,
-        source_code,
-        &source_manager,
-    )?;
-    let library = assembler.clone().assemble_library([module])?;
-    Ok(library)
-}
 
 pub async fn create_basic_account(
     client: &mut Client,
@@ -72,7 +55,7 @@ pub async fn create_basic_faucet(
     let mut init_seed = [0u8; 32];
     client.rng().fill_bytes(&mut init_seed);
     let key_pair = SecretKey::with_rng(client.rng());
-    let symbol = TokenSymbol::new("MID").unwrap();
+    let symbol = TokenSymbol::new("MDN").unwrap();
     let decimals = 8;
     let max_supply = Felt::new(1_000_000_000);
     let builder = AccountBuilder::new(init_seed)
@@ -204,4 +187,76 @@ pub async fn wait_for_notes(
         sleep(Duration::from_secs(3)).await;
     }
     Ok(())
+}
+
+pub async fn create_amm_account(account_code: &str) -> Result<(Account, Word), Error> {
+    let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
+
+    let counter_component = AccountComponent::compile(
+        account_code.to_string(),
+        assembler.clone(),
+        vec![StorageSlot::Value([
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+        ])],
+    )
+    .unwrap()
+    .with_supports_all_types();
+
+    let (counter_contract, counter_seed) = AccountBuilder::new([3u8; 32])
+        .account_type(AccountType::RegularAccountImmutableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(auth::NoAuth)
+        .with_component(counter_component.clone())
+        .build()
+        .unwrap();
+
+    Ok((counter_contract, counter_seed))
+}
+
+pub async fn create_amm_input_note(
+    note_code: String,
+    account_library: Library,
+    creator_account: Account,
+    counter_contract_id: AccountId,
+) -> Result<Note, Error> {
+    let assembler = TransactionKernel::assembler()
+        .with_library(&account_library)
+        .unwrap()
+        .with_debug_mode(true);
+    let serial_num = Word::default();
+    let note_script = NoteScript::compile(note_code, assembler.clone()).unwrap();
+    let note_inputs = NoteInputs::new([].to_vec()).unwrap();
+    let recipient = NoteRecipient::new(serial_num, note_script, note_inputs.clone());
+
+    let tag = NoteTag::from_account_id(counter_contract_id);
+    let metadata = NoteMetadata::new(
+        creator_account.id(),
+        NoteType::Public,
+        tag,
+        NoteExecutionHint::none(),
+        Felt::new(0),
+    )
+    .unwrap();
+
+    let note = Note::new(NoteAssets::default(), metadata, recipient);
+
+    Ok(note)
+}
+
+pub fn create_library(
+    account_code: String,
+    library_path: &str,
+) -> Result<Library, Box<dyn std::error::Error>> {
+    let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let module = Module::parser(ModuleKind::Library).parse_str(
+        LibraryPath::new(library_path)?,
+        account_code,
+        &source_manager,
+    )?;
+    let library = assembler.clone().assemble_library([module])?;
+    Ok(library)
 }

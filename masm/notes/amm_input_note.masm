@@ -1,0 +1,12 @@
+use.external_contract::amm_contract
+
+begin
+    push.111 debug.stack drop
+
+    # Push the required inputs for get_amount_y_out: [x, y, dx]
+    push.100 push.200 push.50
+    call.amm_contract::get_amount_y_out
+
+    # Clean up the result to maintain stack balance
+    drop
+end
