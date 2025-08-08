@@ -2,13 +2,13 @@ use.external_contract::amm_contract
 use.std::sys
 
 begin
-    push.1000000
+    push.500000
 
-    push.100000000
-    push.100000000
+    push.10000000
+    push.10000000
     # => [x, y, dx]
 
-    call.amm_contract::test_math
+    call.amm_contract::get_amount_y_out
     # => [dy]
 
     exec.sys::truncate_stack

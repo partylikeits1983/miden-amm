@@ -5,7 +5,7 @@ use.std::sys
 # CONSTANTS
 # =================================================================================================
 const.MAX_U32=0x0000000100000000
-const.BASE=0x000186A0 # 1e5
+const.BASE=10000 # 1e4
 
 # Memory Addresses for AMM calculations
 const.POOL_X = 0x0040
@@ -13,67 +13,69 @@ const.POOL_Y = 0x0041
 const.DX_IN = 0x0042
 const.DY_OUT = 0x0043
 
+# Run time u64 memory addresses
+const.DX_MUL_Y_BASE = 100
+const.DX_PLUS_Y = 104
+
 # AMM CALCULATION
 # =================================================================================================
 
 #! Calculates the amount of asset Y to return given input of asset X
-#! Formula: dy = (dx * y) / (dx + x)
+#! Formula: dy = (dx * y * BASE) / (dx + y)
 #!
 #! Inputs: [x, y, dx]
 #! Outputs: [dy]
 export.get_amount_y_out
-    # Store inputs in memory for easier manipulation
-    mem_store.DX_IN     # dx -> memory
-    mem_store.POOL_Y    # y -> memory
-    mem_store.POOL_X    # x -> memory
-
-    push.222 debug.stack drop
-
-    # Calculate numerator: dx * y
-    mem_load.DX_IN
-    u32split            # Convert to u64 format [dx_hi, dx_lo]
-
-    mem_load.POOL_Y
-    u32split            # Convert to u64 format [y_hi, y_lo, dx_hi, dx_lo]
-
-    exec.u64::wrapping_mul  # dx * y -> [numerator_hi, numerator_lo]
-
-    # Calculate denominator: dx + x
-    mem_load.DX_IN
-    mem_load.POOL_X
-    add                 # dx + x -> [denominator, numerator_hi, numerator_lo]
-
-    u32split            # Convert denominator to u64 format [denom_hi, denom_lo, numerator_hi, numerator_lo]
-
-    # Perform division: (dx * y) / (dx + x)
-    exec.u64::div       # [quotient_hi, quotient_lo, remainder_hi, remainder_lo]
-
-    # Drop the remainder (we only want the quotient)
-    drop drop           # [quotient_hi, quotient_lo]
-
-    # Convert back to single u32 (assuming result fits in u32)
-    push.MAX_U32 mul add
-
-    drop
-end
-
-# => [x, y, dx]
-export.test_math
-    push.101 debug.stack drop
-
     mem_store.POOL_X
     mem_store.POOL_Y
     mem_store.DX_IN
-
     # => []
-
-    # dy = (dx * y * BASE) / (dx + x)
 
     mem_load.DX_IN
     u32split
-    # => [dx_low, dx_high]
+    # => [dx_high, dx_low]
 
-    push.222 debug.stack drop
+    mem_load.POOL_Y
+    u32split
+    # => [y_high, y_low, dx_high, dx_low]
+
+    exec.u64::wrapping_mul
+    # => [dxy_high, dyx_low]
+
+    push.BASE
+    u32split
+    # => [base_high, base_low, dxy_high, dyx_low]
+
+    exec.u64::wrapping_mul
+    # => [dxyb_high, dyxb_loww]
+
+    push.0.0
+    # => [0, 0, dxyb_high, dyxb_low]
+
+    mem_storew.DX_MUL_Y_BASE dropw
+    # => []
+
+    mem_load.DX_IN
+    u32split
+    # => [dx_high, dx_low]
+
+    mem_load.POOL_Y
+    u32split
+    # => [dx_high, dx_low, y_high, y_low]
+
+    exec.u64::wrapping_add
+    # => [sum_dx_y_high, sum_dx_y_low]
+
+    padw mem_loadw.DX_MUL_Y_BASE drop drop
+    # => [dxyb_high, dyxb_low, sum_dx_y_high, sum_dx_y_low]
+
+    movup.3 movup.3
+    # => [sum_dx_y_high, sum_dx_y_low, dxyb_high, dyxb_low]
+
+    exec.u64::div
+    # => [dy_high, dy_low]
+
+    push.444 debug.stack drop
 
     exec.sys::truncate_stack
 end
