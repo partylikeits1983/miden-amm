@@ -5,11 +5,13 @@ use.std::sys
 # CONSTANTS
 # =================================================================================================
 const.MAX_U32=0x0000000100000000
+const.BASE=0x000186A0 # 1e5
 
 # Memory Addresses for AMM calculations
 const.POOL_X = 0x0040
 const.POOL_Y = 0x0041
 const.DX_IN = 0x0042
+const.DY_OUT = 0x0043
 
 # AMM CALCULATION
 # =================================================================================================
@@ -19,7 +21,6 @@ const.DX_IN = 0x0042
 #!
 #! Inputs: [x, y, dx]
 #! Outputs: [dy]
-#!
 export.get_amount_y_out
     # Store inputs in memory for easier manipulation
     mem_store.DX_IN     # dx -> memory
@@ -54,4 +55,25 @@ export.get_amount_y_out
     push.MAX_U32 mul add
 
     drop
+end
+
+# => [x, y, dx]
+export.test_math
+    push.101 debug.stack drop
+
+    mem_store.POOL_X
+    mem_store.POOL_Y
+    mem_store.DX_IN
+
+    # => []
+
+    # dy = (dx * y * BASE) / (dx + x)
+
+    mem_load.DX_IN
+    u32split
+    # => [dx_low, dx_high]
+
+    push.222 debug.stack drop
+
+    exec.sys::truncate_stack
 end

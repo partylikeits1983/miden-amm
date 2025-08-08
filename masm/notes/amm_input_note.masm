@@ -1,12 +1,15 @@
 use.external_contract::amm_contract
+use.std::sys
 
 begin
-    push.111 debug.stack drop
+    push.1000000
 
-    # Push the required inputs for get_amount_y_out: [x, y, dx]
-    push.100 push.200 push.50
-    call.amm_contract::get_amount_y_out
+    push.100000000
+    push.100000000
+    # => [x, y, dx]
 
-    # Clean up the result to maintain stack balance
-    drop
+    call.amm_contract::test_math
+    # => [dy]
+
+    exec.sys::truncate_stack
 end
