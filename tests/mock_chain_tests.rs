@@ -101,3 +101,19 @@ async fn amm_test() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_convert_two_32bit_to_64bit() {
+    // Your two 32-bit integers
+    let int1: u32 = 3;
+    let int2: u32 = 2343097389;
+
+    // Convert to 64-bit integer (int2 as high bits, int1 as low bits)
+    let result: u64 = ((int2 as u64) << 32) | (int1 as u64);
+
+    println!("Converting two 32-bit integers to 64-bit:");
+    let result_alt: u64 = ((int1 as u64) << 32) | (int2 as u64);
+    println!("value: {}", result_alt);
+
+    assert!(result > 0);
+}
