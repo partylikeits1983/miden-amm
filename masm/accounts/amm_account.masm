@@ -5,8 +5,8 @@ use.std::sys
 # CONSTANTS
 # =================================================================================================
 const.MAX_U32=0x0000000100000000
-const.BASE=10000 # 1e4
-const.DIV=10000 # 1e4
+const.BASE=1000 # 1e3
+const.DIV=1000 # 1e3
 
 # Memory Addresses for AMM calculations
 const.POOL_X = 0x0040
@@ -18,24 +18,25 @@ const.DY_OUT = 0x0043
 const.DX_MUL_Y_BASE = 100
 const.DX_PLUS_Y = 104
 
+# ERRORS
+const.OVERFLOW="value larger than 32 bits"
+
 # AMM CALCULATION
 # =================================================================================================
 
 #! Calculates the amount of asset Y to return given input of asset X
-#! Formula: dy = (dx * y * BASE) / (dx + y)
+#! Formula: dy = (dx * y) / (dx + y)
+#!
+#! Assumes input values are base 1e3
+#! Returns dy as fixed point 1e3
 #!
 #! Inputs: [x, y, dx]
 #! Outputs: [dy]
 export.get_amount_y_out
-
-    push.111 debug.stack drop
-
     mem_store.POOL_X
     mem_store.POOL_Y
     mem_store.DX_IN
     # => []
-
-    push.222 debug.stack drop
 
     mem_load.DX_IN
     u32split
@@ -47,13 +48,6 @@ export.get_amount_y_out
 
     exec.u64::wrapping_mul
     # => [dxy_high, dyx_low]
-
-    push.BASE
-    u32split
-    # => [base_high, base_low, dxy_high, dyx_low]
-
-    exec.u64::wrapping_mul
-    # => [dxyb_high, dyxb_low]
 
     push.0.0
     # => [0, 0, dxyb_high, dyxb_low]
@@ -81,16 +75,7 @@ export.get_amount_y_out
     exec.u64::div
     # => [dy_base_high, dy_base_low]
 
-    push.444 debug.stack drop
-
-    push.DIV
-    u32split
-    # => [base_high, base_low, dy_high, dy_low]
-
-    exec.u64::div
-    # => [dy_high, dy_low]
-
-    push.555 debug.stack drop
+    eq.0 assert.err=OVERFLOW
 
     exec.sys::truncate_stack
 end

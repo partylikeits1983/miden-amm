@@ -2,16 +2,19 @@ use.external_contract::amm_contract
 use.std::sys
 
 begin
-    # 500 * 1e4
-    push.5000000
+    # 50_000 * 1e3
+    push.50000000
 
-    # 1000 * 1e4
-    push.10000000
-    push.10000000
+    # 100_000 * 1e3
+    push.100000000
+    push.100000000
     # => [x, y, dx]
 
+    # returns fixed point base 1e3
     call.amm_contract::get_amount_y_out
-    # => [dy_high, dy_low]
+    # => [dy]
+
+    push.111 debug.stack drop
 
     exec.sys::truncate_stack
 end
