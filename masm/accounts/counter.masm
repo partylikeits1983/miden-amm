@@ -3,7 +3,6 @@ use.std::sys
 
 const.COUNTER_SLOT=0
 # => []
-
 export.get_count
     push.COUNTER_SLOT
     # => [index]
@@ -16,7 +15,6 @@ export.get_count
 end
 
 # => []
-
 export.increment_count
     push.COUNTER_SLOT
     # => [index]
