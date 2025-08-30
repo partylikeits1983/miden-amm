@@ -1,0 +1,65 @@
+use.external_contract::deposit_withdraw_contract
+use.miden::note
+use.std::sys
+
+# CONSTANTS
+# =================================================================================================
+
+const.ASSET_PTR=100
+
+#! Deposit note that transfers assets to a deposit_withdraw contract
+#!
+#! Inputs (arguments): []
+#! Outputs: []
+#!
+#! This note transfers all assets contained in the note to the target account
+#! by calling the deposit procedure on the account.
+begin
+
+    debug.stack
+
+    push.0 exec.note::get_inputs
+    # => [num_inputs]
+
+    eq.0
+    # => [no_inputs]
+
+    push.111 debug.stack drop
+
+    if.true
+
+        # Write the asset in note to memory address ASSET_PTR
+        push.ASSET_PTR exec.note::get_assets
+        # => [num_assets, dest_ptr]
+
+        drop
+        # => [dest_ptr]
+
+        # Load asset from memory
+        mem_loadw
+        # => [ASSET]
+
+        # Call the deposit procedure on the target account
+        # This will store the asset in the account's vault and update the balance
+        call.deposit_withdraw_contract::deposit
+        # => []
+
+    else
+
+        push.111 debug.stack drop
+
+        # store note inputs into memory starting at address 0
+        #push.0 exec.note::get_inputs drop
+        # => [num_inputs, inputs_ptr]
+
+        mem_loadw.0
+        padw mem_loadw.4
+        # => [tag, aux, note_type, execution_hint, RECIPIENT]
+
+        call.deposit_withdraw_contract::withdraw
+
+    end
+
+    exec.sys::truncate_stack
+
+end
