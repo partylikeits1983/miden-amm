@@ -1,1 +1,5 @@
 /target
+keystore/
+store.sqlite3
+*.sqlite
+*.sqlite3
