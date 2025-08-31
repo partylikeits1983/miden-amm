@@ -121,7 +121,6 @@ end
 
 # => [faucet_x_prefix, faucet_x_suffix, faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
 export.swap
-
     ### ____ AMM COMPUTATION ____
 
     # get balance faucet_id_in
