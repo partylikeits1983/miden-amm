@@ -42,6 +42,8 @@ begin
     call.deposit_withdraw_contract::swap
     # => []
 
+    debug.stack
+
     exec.sys::truncate_stack
 
 end
