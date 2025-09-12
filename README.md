@@ -2,5 +2,5 @@
 
 Running tests:
 ```
-cargo test test_deposit_withdraw_local --release -- --nocapture
+cargo test amm_local_test --release -- --nocapture
 ```

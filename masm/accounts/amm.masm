@@ -36,7 +36,7 @@ const.BALANCES_SLOT=0
 # =================================================================================================
 
 #! Calculates the amount of asset Y to return given input of asset X
-#! Formula:
+#! Formula: dy = (dx * y) / (dx + x)
 #!
 #! Assumes input values are base 1e3
 #! Returns dy as fixed point 1e3
@@ -202,8 +202,6 @@ end
 # => []
 export.deposit
     # => [ASSET]
-
-    push.222 debug.stack drop
 
     dupw
     # => [ASSET, ASSET]
