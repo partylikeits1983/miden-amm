@@ -7,9 +7,10 @@ use miden_assembly::{
     ast::{Module, ModuleKind},
 };
 use miden_client::{
-    ClientError, Felt,
+    ClientError, Felt, ScriptBuilder,
     account::{AccountBuilder, AccountStorageMode, AccountType, StorageSlot},
     builder::ClientBuilder,
+    keystore::FilesystemKeyStore,
     rpc::{Endpoint, TonicRpcClient},
     transaction::{TransactionKernel, TransactionRequestBuilder, TransactionScript},
 };
@@ -41,10 +42,12 @@ async fn main() -> Result<(), ClientError> {
     let timeout_ms = 10_000;
     let rpc_api = Arc::new(TonicRpcClient::new(&endpoint, timeout_ms));
 
+    let keystore = FilesystemKeyStore::new("./keystore".into()).unwrap().into();
+
     let mut client = ClientBuilder::new()
         .rpc(rpc_api)
-        .filesystem_keystore("./keystore")
-        .in_debug_mode(true)
+        .authenticator(keystore)
+        .in_debug_mode(true.into())
         .build()
         .await?;
 
@@ -67,12 +70,9 @@ async fn main() -> Result<(), ClientError> {
     let counter_component = AccountComponent::compile(
         counter_code.clone(),
         assembler,
-        vec![StorageSlot::Value([
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-        ])],
+        vec![StorageSlot::Value(
+            [Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)].into(),
+        )],
     )
     .unwrap()
     .with_supports_all_types();
@@ -94,10 +94,7 @@ async fn main() -> Result<(), ClientError> {
         "counter_contract commitment: {:?}",
         counter_contract.commitment()
     );
-    println!(
-        "counter_contract id: {:?}",
-        counter_contract.id().to_bech32(NetworkId::Testnet)
-    );
+
     println!("counter_contract storage: {:?}", counter_contract.storage());
 
     client
@@ -122,11 +119,11 @@ async fn main() -> Result<(), ClientError> {
     )
     .unwrap();
 
-    let tx_script = TransactionScript::compile(
-        script_code,
-        assembler.with_library(&account_component_lib).unwrap(),
-    )
-    .unwrap();
+    let tx_script = ScriptBuilder::new(true)
+        .with_dynamically_linked_library(&account_component_lib)
+        .unwrap()
+        .compile_tx_script(script_code)
+        .unwrap();
 
     // Build a transaction request with the custom script
     let tx_increment_request = TransactionRequestBuilder::new()

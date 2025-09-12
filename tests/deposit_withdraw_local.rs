@@ -1,4 +1,5 @@
-use miden_lib::account::wallets::BasicWallet;
+use anyhow::Result;
+use miden_lib::account::{auth::AuthRpoFalcon512, wallets::BasicWallet};
 use rand::{RngCore, rngs::StdRng};
 use std::{fs, path::Path, sync::Arc};
 use tokio::time::{Duration, sleep};
@@ -8,10 +9,10 @@ use miden_assembly::{
     ast::{Module, ModuleKind},
 };
 use miden_client::{
-    Client, ClientError, Felt, Word,
+    Client, ClientError, Felt, ScriptBuilder, Word,
     account::{
-        Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageMap,
-        StorageSlot,
+        Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType,
+        Address, AddressInterface, StorageMap, StorageSlot,
         component::{BasicFungibleFaucet, RpoFalcon512},
     },
     asset::{FungibleAsset, TokenSymbol},
@@ -40,22 +41,28 @@ fn create_library(
     assembler: Assembler,
     library_path: &str,
     source_code: &str,
-) -> Result<miden_assembly::Library, Box<dyn std::error::Error>> {
+) -> Result<miden_assembly::Library> {
     let source_manager = Arc::new(DefaultSourceManager::default());
-    let module = Module::parser(ModuleKind::Library).parse_str(
-        LibraryPath::new(library_path)?,
-        source_code,
-        &source_manager,
-    )?;
-    let library = assembler.clone().assemble_library([module])?;
+    let module = Module::parser(ModuleKind::Library)
+        .parse_str(
+            LibraryPath::new(library_path)
+                .map_err(|e| anyhow::anyhow!("Failed to create library path: {}", e))?,
+            source_code,
+            &source_manager,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to parse module: {}", e))?;
+    let library = assembler
+        .clone()
+        .assemble_library([module])
+        .map_err(|e| anyhow::anyhow!("Failed to assemble library: {}", e))?;
     Ok(library)
 }
 
 // Helper to create a basic account
 async fn create_basic_account(
-    client: &mut Client,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
-) -> Result<Account, ClientError> {
+) -> Result<miden_client::account::Account, ClientError> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
@@ -63,7 +70,7 @@ async fn create_basic_account(
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(RpoFalcon512::new(key_pair.public_key()))
+        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
         .with_component(BasicWallet);
     let (account, seed) = builder.build().unwrap();
     client.add_account(&account, Some(seed), false).await?;
@@ -75,9 +82,9 @@ async fn create_basic_account(
 }
 
 async fn create_basic_faucet(
-    client: &mut Client,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
-) -> Result<Account, ClientError> {
+) -> Result<miden_client::account::Account, ClientError> {
     let mut init_seed = [0u8; 32];
     client.rng().fill_bytes(&mut init_seed);
     let key_pair = SecretKey::with_rng(client.rng());
@@ -87,7 +94,7 @@ async fn create_basic_faucet(
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(RpoFalcon512::new(key_pair.public_key()))
+        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
         .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap());
     let (account, seed) = builder.build().unwrap();
     client.add_account(&account, Some(seed), false).await?;
@@ -120,47 +127,31 @@ async fn create_basic_faucet(
 /// printing status messages every 2 seconds. It checks both consumable and committed note collections
 /// as well as transaction commitment status.
 pub async fn wait_for_note(
-    client: &mut Client,
-    account_id: Option<Account>,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
+    account_id: &Account,
     expected: &Note,
-    tx_id: TransactionId,
 ) -> Result<(), ClientError> {
     loop {
         client.sync_state().await?;
 
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed(_))
-        } else {
-            false
-        };
+        let notes: Vec<(InputNoteRecord, Vec<(AccountId, NoteRelevance)>)> =
+            client.get_consumable_notes(Some(account_id.id())).await?;
 
-        if tx_committed {
-            println!(
-                "✅ transaction {} committed for note {}",
-                tx_id.to_hex(),
-                expected.id().to_hex()
-            );
+        let found = notes.iter().any(|(rec, _)| rec.id() == expected.id());
+
+        if found {
+            println!("✅ note found {}", expected.id().to_hex());
             break;
-        } else {
-            println!(
-                "Transaction {} not yet committed for note {}. Waiting...",
-                tx_id.to_hex(),
-                expected.id().to_hex()
-            );
         }
 
-        sleep(Duration::from_secs(2)).await;
+        println!("Note {} not found. Waiting...", expected.id().to_hex());
+        sleep(Duration::from_secs(3)).await;
     }
-
     Ok(())
 }
 
 #[tokio::test]
-async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
+async fn test_deposit_withdraw_local() -> Result<()> {
     // Initialize client & keystore
     let endpoint = Endpoint::testnet();
     let timeout_ms = 10_000;
@@ -169,14 +160,14 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     let mut client = ClientBuilder::new()
         .rpc(rpc_api)
         .filesystem_keystore("./keystore")
-        .in_debug_mode(true)
+        .in_debug_mode(true.into())
         .build()
         .await?;
 
-    let sync_summary = client.sync_state().await.unwrap();
+    let sync_summary = client.sync_state().await?;
     println!("Latest block: {}", sync_summary.block_num);
 
-    let keystore = FilesystemKeyStore::new("./keystore".into()).unwrap();
+    let keystore = FilesystemKeyStore::new("./keystore".into())?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Create accounts and deploy faucet
@@ -186,14 +177,22 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     let alice_account_id = alice_account.id();
     println!(
         "Alice's account ID: {:?}",
-        alice_account_id.to_bech32(NetworkId::Testnet)
+        Address::from(AccountIdAddress::new(
+            alice_account_id,
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
     );
 
     println!("\nDeploying a new fungible faucet.");
     let faucet = create_basic_faucet(&mut client, keystore.clone()).await?;
     println!(
         "Faucet account ID: {:?}",
-        faucet.id().to_bech32(NetworkId::Testnet)
+        Address::from(AccountIdAddress::new(
+            faucet.id(),
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
     );
     client.sync_state().await?;
 
@@ -207,15 +206,14 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
 
     // Load the MASM file for the deposit_withdraw contract
     let contract_path = Path::new("masm/accounts/deposit_withdraw.masm");
-    let contract_code = fs::read_to_string(contract_path).unwrap();
+    let contract_code = fs::read_to_string(contract_path)?;
 
     let storage_map = StorageMap::new();
     let storage_slot_map = StorageSlot::Map(storage_map.clone());
 
     // Compile the account code into `AccountComponent` with one storage slot for balance
     let contract_component =
-        AccountComponent::compile(contract_code.clone(), assembler, vec![storage_slot_map])
-            .unwrap()
+        AccountComponent::compile(contract_code.clone(), assembler, vec![storage_slot_map])?
             .with_supports_all_types();
 
     // Init seed for the deposit_withdraw contract
@@ -231,8 +229,7 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
         .with_component(BasicWallet)
         .with_component(contract_component.clone())
         .with_auth_component(NoAuth)
-        .build()
-        .unwrap();
+        .build()?;
 
     println!(
         "deposit_contract commitment: {:?}",
@@ -240,18 +237,19 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     );
     println!(
         "deposit_contract id: {:?}",
-        deposit_contract.id().to_bech32(NetworkId::Testnet)
+        Address::from(AccountIdAddress::new(
+            faucet.id(),
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
     );
     println!("deposit_contract storage: {:?}", deposit_contract.storage());
 
     client
         .add_account(&deposit_contract.clone(), Some(contract_seed), false)
-        .await
-        .unwrap();
+        .await?;
 
-    keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
-        .unwrap();
+    keystore.add_key(&AuthSecretKey::RpoFalcon512(key_pair))?;
 
     // -------------------------------------------------------------------------
     // STEP 3: Mint tokens for Alice
@@ -259,15 +257,13 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     println!("\n[STEP 3] Mint tokens for Alice");
     let faucet_id = faucet.id();
     let amount: u64 = 100;
-    let mint_amount = FungibleAsset::new(faucet_id, amount).unwrap();
-    let tx_request = TransactionRequestBuilder::new()
-        .build_mint_fungible_asset(
-            mint_amount,
-            alice_account_id,
-            NoteType::Public,
-            client.rng(),
-        )
-        .unwrap();
+    let mint_amount = FungibleAsset::new(faucet_id, amount)?;
+    let tx_request = TransactionRequestBuilder::new().build_mint_fungible_asset(
+        mint_amount,
+        alice_account_id,
+        NoteType::Public,
+        client.rng(),
+    )?;
 
     let tx_exec = client.new_transaction(faucet.id(), tx_request).await?;
     client.submit_transaction(tx_exec.clone()).await?;
@@ -275,22 +271,16 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     let p2id_note = if let OutputNote::Full(note) = tx_exec.created_notes().get_note(0) {
         note.clone()
     } else {
-        panic!("Expected OutputNote::Full");
+        return Err(anyhow::anyhow!("Expected OutputNote::Full"));
     };
 
     // Wait for the P2ID note to be available
-    wait_for_note(
-        &mut client,
-        Some(alice_account.clone()),
-        &p2id_note,
-        tx_exec.executed_transaction().id(),
-    )
-    .await?;
+
+    wait_for_note(&mut client, &alice_account, &p2id_note).await?;
 
     let consume_request = TransactionRequestBuilder::new()
         .authenticated_input_notes([(p2id_note.id(), None)])
-        .build()
-        .unwrap();
+        .build()?;
     let tx_exec = client
         .new_transaction(alice_account_id, consume_request)
         .await?;
@@ -309,16 +299,20 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
         assembler.clone(),
         "external_contract::deposit_withdraw_contract",
         &contract_code,
-    )
-    .unwrap();
+    )?;
 
-    let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm")).unwrap();
+    let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm"))?;
     let serial_num = client.rng().draw_word();
-    let note_script =
-        NoteScript::compile(note_code, assembler.with_library(&contract_lib).unwrap()).unwrap();
-    let note_inputs = NoteInputs::new(vec![]).unwrap(); // No special inputs needed
+
+    let note_script = ScriptBuilder::new(true)
+        .with_dynamically_linked_library(&contract_lib)
+        .unwrap()
+        .compile_note_script(note_code)
+        .unwrap();
+
+    let note_inputs = NoteInputs::new(vec![])?; // No special inputs needed
     let recipient = NoteRecipient::new(serial_num, note_script, note_inputs);
-    let tag = NoteTag::for_public_use_case(0, 0, NoteExecutionMode::Local).unwrap();
+    let tag = NoteTag::for_public_use_case(0, 0, NoteExecutionMode::Local)?;
     let metadata = NoteMetadata::new(
         alice_account_id,
         NoteType::Public,
@@ -332,12 +326,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
 
     let note_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![OutputNote::Full(deposit_note.clone())])
-        .build()
-        .unwrap();
+        .build()?;
     let tx_result = client
         .new_transaction(alice_account_id, note_request)
-        .await
-        .unwrap();
+        .await?;
     println!(
         "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
         tx_result.executed_transaction().id()
@@ -345,13 +337,7 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     let _ = client.submit_transaction(tx_result.clone()).await;
     client.sync_state().await?;
 
-    wait_for_note(
-        &mut client,
-        Some(deposit_contract.clone()),
-        &deposit_note,
-        tx_result.executed_transaction().id(),
-    )
-    .await?;
+    wait_for_note(&mut client, &deposit_contract, &deposit_note).await?;
 
     // -------------------------------------------------------------------------
     // STEP 5: Consume the deposit note (deposit assets into contract)
@@ -362,12 +348,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
 
     let consume_deposit_request = TransactionRequestBuilder::new()
         .unauthenticated_input_notes([(deposit_note, None)])
-        .build()
-        .unwrap();
+        .build()?;
     let tx_result = client
         .new_transaction(deposit_contract.id(), consume_deposit_request)
-        .await
-        .unwrap();
+        .await?;
     println!(
         "Deposit Tx on MidenScan: https://testnet.midenscan.com/tx/{:?}",
         tx_result.executed_transaction().id()
@@ -375,10 +359,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     println!("account delta: {:?}", tx_result.account_delta().vault());
     let _ = client.submit_transaction(tx_result).await;
 
-    client.sync_state().await.unwrap();
+    client.sync_state().await?;
 
     // Retrieve updated contract data to see the balance
-    let account = client.get_account(deposit_contract.id()).await.unwrap();
+    let account = client.get_account(deposit_contract.id()).await?;
     println!(
         "deposit contract balance: {:?}",
         account.unwrap().account().storage().get_item(0)
@@ -397,8 +381,7 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
         NoteType::Private,
         Felt::new(0),
         client.rng(),
-    )
-    .unwrap();
+    )?;
 
     println!(
         "Withdraw P2ID note hash: {:?}",
@@ -418,13 +401,16 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
         assembler.clone(),
         "external_contract::deposit_withdraw_contract",
         &contract_code,
-    )
-    .unwrap();
+    )?;
 
-    let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm")).unwrap();
+    let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm"))?;
     let serial_num = client.rng().draw_word();
-    let note_script =
-        NoteScript::compile(note_code, assembler.with_library(&contract_lib).unwrap()).unwrap();
+
+    let note_script = ScriptBuilder::new(true)
+        .with_dynamically_linked_library(&contract_lib)
+        .unwrap()
+        .compile_note_script(note_code)
+        .unwrap();
 
     let p2id_withdraw_recipient: Word = withdraw_p2id_note.recipient().digest().into();
 
@@ -437,11 +423,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
         withdraw_p2id_note.metadata().note_type().into(),
         Felt::new(0),
         withdraw_p2id_note.metadata().tag().into(),
-    ])
-    .unwrap();
+    ])?;
 
     let withdrawal_note_recipient = NoteRecipient::new(serial_num, note_script, note_inputs);
-    let tag = NoteTag::for_public_use_case(0, 0, NoteExecutionMode::Local).unwrap();
+    let tag = NoteTag::for_public_use_case(0, 0, NoteExecutionMode::Local)?;
     let metadata = NoteMetadata::new(
         alice_account_id,
         NoteType::Public,
@@ -455,12 +440,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
 
     let note_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![OutputNote::Full(withdrawal_note.clone())])
-        .build()
-        .unwrap();
+        .build()?;
     let tx_result = client
         .new_transaction(alice_account_id, note_request)
-        .await
-        .unwrap();
+        .await?;
     println!(
         "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
         tx_result.executed_transaction().id()
@@ -469,13 +452,8 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     client.sync_state().await?;
 
     // Wait for the withdrawal note to be available
-    wait_for_note(
-        &mut client,
-        Some(alice_account.clone()),
-        &withdrawal_note,
-        tx_result.executed_transaction().id(),
-    )
-    .await?;
+
+    wait_for_note(&mut client, &alice_account, &withdrawal_note).await?;
 
     // -------------------------------------------------------------------------
     // STEP 8: Consume the withdrawal note
@@ -486,12 +464,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
 
     let consume_deposit_request = TransactionRequestBuilder::new()
         .unauthenticated_input_notes([(withdrawal_note.clone(), None)])
-        .build()
-        .unwrap();
+        .build()?;
     let tx_result = client
         .new_transaction(deposit_contract.id(), consume_deposit_request)
-        .await
-        .unwrap();
+        .await?;
     println!(
         "Deposit Tx on MidenScan: https://testnet.midenscan.com/tx/{:?}",
         tx_result.executed_transaction().id()
@@ -499,22 +475,16 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     println!("account delta: {:?}", tx_result.account_delta().vault());
     let _ = client.submit_transaction(tx_result.clone()).await;
 
-    client.sync_state().await.unwrap();
+    client.sync_state().await?;
 
     // Retrieve updated contract data to see the balance
-    let account = client.get_account(deposit_contract.id()).await.unwrap();
+    let account = client.get_account(deposit_contract.id()).await?;
     println!(
         "deposit contract balance: {:?}",
         account.unwrap().account().storage().get_item(0)
     );
 
-    wait_for_note(
-        &mut client,
-        Some(alice_account.clone()),
-        &withdrawal_note,
-        tx_result.executed_transaction().id(),
-    )
-    .await?;
+    wait_for_note(&mut client, &alice_account, &withdrawal_note).await?;
 
     // -------------------------------------------------------------------------
     // STEP 9: Consume the private p2id note
@@ -523,12 +493,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
 
     let consume_deposit_request = TransactionRequestBuilder::new()
         .unauthenticated_input_notes([(withdraw_p2id_note.clone(), None)])
-        .build()
-        .unwrap();
+        .build()?;
     let tx_result = client
         .new_transaction(alice_account_id, consume_deposit_request)
-        .await
-        .unwrap();
+        .await?;
     println!(
         "Deposit Tx on MidenScan: https://testnet.midenscan.com/tx/{:?}",
         tx_result.executed_transaction().id()
@@ -536,10 +504,10 @@ async fn test_deposit_withdraw_local() -> Result<(), ClientError> {
     println!("account delta: {:?}", tx_result.account_delta().vault());
     let _ = client.submit_transaction(tx_result.clone()).await;
 
-    client.sync_state().await.unwrap();
+    client.sync_state().await?;
 
     // Retrieve updated contract data to see the balance
-    let account = client.get_account(deposit_contract.id()).await.unwrap();
+    let account = client.get_account(deposit_contract.id()).await?;
     println!(
         "deposit contract balance: {:?}",
         account.unwrap().account().storage().get_item(0)

@@ -1,4 +1,7 @@
-use miden_lib::account::wallets::BasicWallet;
+use miden_lib::{
+    account::{auth::AuthRpoFalcon512, wallets::BasicWallet},
+    errors::note_script_errors,
+};
 use rand::{RngCore, rngs::StdRng};
 use std::{fs, path::Path, sync::Arc};
 use tokio::time::{Duration, sleep};
@@ -10,8 +13,8 @@ use miden_assembly::{
 use miden_client::{
     Client, ClientError, Felt, Word,
     account::{
-        Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageMap,
-        StorageSlot,
+        Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType,
+        Address, AddressInterface, StorageMap, StorageSlot,
         component::{BasicFungibleFaucet, RpoFalcon512},
     },
     asset::{FungibleAsset, TokenSymbol},
@@ -54,9 +57,9 @@ fn create_library(
 
 // Helper to create a basic account
 async fn create_basic_account(
-    client: &mut Client,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
-) -> Result<Account, ClientError> {
+) -> Result<miden_client::account::Account, ClientError> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
@@ -64,7 +67,7 @@ async fn create_basic_account(
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(RpoFalcon512::new(key_pair.public_key()))
+        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
         .with_component(BasicWallet);
     let (account, seed) = builder.build().unwrap();
     client.add_account(&account, Some(seed), false).await?;
@@ -76,7 +79,7 @@ async fn create_basic_account(
 }
 
 async fn create_basic_faucet(
-    client: &mut Client,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
 ) -> Result<Account, ClientError> {
     let mut init_seed = [0u8; 32];
@@ -100,9 +103,33 @@ async fn create_basic_faucet(
 
 /// Waits for a specific transaction to be committed.
 pub async fn wait_for_note(
-    client: &mut Client,
-    account_id: Option<Account>,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
+    account_id: &Account,
     expected: &Note,
+) -> Result<(), ClientError> {
+    loop {
+        client.sync_state().await?;
+
+        let notes: Vec<(InputNoteRecord, Vec<(AccountId, NoteRelevance)>)> =
+            client.get_consumable_notes(Some(account_id.id())).await?;
+
+        let found = notes.iter().any(|(rec, _)| rec.id() == expected.id());
+
+        if found {
+            println!("✅ note found {}", expected.id().to_hex());
+            break;
+        }
+
+        println!("Note {} not found. Waiting...", expected.id().to_hex());
+        sleep(Duration::from_secs(3)).await;
+    }
+    Ok(())
+}
+
+/// Waits for a specific transaction to be committed.
+/// Waits for a specific transaction to be committed.
+async fn wait_for_tx(
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     tx_id: TransactionId,
 ) -> Result<(), ClientError> {
     loop {
@@ -113,49 +140,22 @@ pub async fn wait_for_note(
             .get_transactions(TransactionFilter::Ids(vec![tx_id]))
             .await?;
         let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed(_))
+            matches!(txs[0].status, TransactionStatus::Committed { .. })
         } else {
             false
         };
 
         if tx_committed {
-            println!("✅ Transaction committed successfully");
+            println!("✅ transaction {} committed", tx_id.to_hex());
             break;
-        } else {
-            println!("⏳ Waiting for transaction commitment...");
         }
 
+        println!(
+            "Transaction {} not yet committed. Waiting...",
+            tx_id.to_hex()
+        );
         sleep(Duration::from_secs(2)).await;
     }
-
-    Ok(())
-}
-
-/// Waits for a specific transaction to be committed.
-pub async fn wait_for_tx(client: &mut Client, tx_id: TransactionId) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed(_))
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ Transaction committed successfully");
-            break;
-        } else {
-            println!("⏳ Waiting for transaction commitment...");
-        }
-
-        sleep(Duration::from_secs(2)).await;
-    }
-
     Ok(())
 }
 
@@ -166,34 +166,42 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let timeout_ms = 10_000;
     let rpc_api = Arc::new(TonicRpcClient::new(&endpoint, timeout_ms));
 
+    let keystore = FilesystemKeyStore::new("./keystore".into()).unwrap().into();
+
     let mut client = ClientBuilder::new()
         .rpc(rpc_api)
-        .filesystem_keystore("./keystore")
-        .in_debug_mode(true)
+        .authenticator(keystore)
+        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
 
-    let keystore = FilesystemKeyStore::new("./keystore".into()).unwrap();
-
     // -------------------------------------------------------------------------
     // STEP 1: Create accounts and deploy faucet
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Creating new accounts");
-    let alice_account = create_basic_account(&mut client, keystore.clone()).await?;
+    let alice_account = create_basic_account(&mut client, keystore).await?;
     let alice_account_id = alice_account.id();
     println!(
         "Alice's account ID: {:?}",
-        alice_account_id.to_bech32(NetworkId::Testnet)
+        Address::from(AccountIdAddress::new(
+            alice_account_id,
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
     );
 
     println!("\nDeploying a new fungible faucet.");
-    let faucet = create_basic_faucet(&mut client, keystore.clone()).await?;
+    let faucet = create_basic_faucet(&mut client, keystore).await?;
     println!(
         "Faucet account ID: {:?}",
-        faucet.id().to_bech32(NetworkId::Testnet)
+        Address::from(AccountIdAddress::new(
+            faucet.id(),
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
     );
     client.sync_state().await?;
 
@@ -238,7 +246,11 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     );
     println!(
         "deposit_contract id: {:?}",
-        deposit_contract.id().to_bech32(NetworkId::Testnet)
+        Address::from(AccountIdAddress::new(
+            faucet.id(),
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
     );
     println!("deposit_contract storage: {:?}", deposit_contract.storage());
 
@@ -317,13 +329,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     };
 
     // Wait for the P2ID note to be available
-    wait_for_note(
-        &mut client,
-        Some(alice_account.clone()),
-        &p2id_note,
-        tx_exec.executed_transaction().id(),
-    )
-    .await?;
+    wait_for_note(&mut client, &alice_account.clone(), &p2id_note).await?;
 
     let consume_request = TransactionRequestBuilder::new()
         .authenticated_input_notes([(p2id_note.id(), None)])
@@ -352,8 +358,12 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
 
     let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm")).unwrap();
     let serial_num = client.rng().draw_word();
-    let note_script =
-        NoteScript::compile(note_code, assembler.with_library(&contract_lib).unwrap()).unwrap();
+
+    let note_script = ScriptBuilder::new(true)
+        .with_dynamically_linked_library(&contract_lib)
+        .unwrap()
+        .compile_note_script(note_code)
+        .unwrap();
     let note_inputs = NoteInputs::new(vec![]).unwrap(); // No special inputs needed
     let recipient = NoteRecipient::new(serial_num, note_script, note_inputs);
 
@@ -388,9 +398,8 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
 
     wait_for_note(
         &mut client,
-        None, // No specific account filter for network notes
+        &alice_account, // No specific account filter for network notes
         &deposit_note,
-        tx_result.executed_transaction().id(),
     )
     .await?;
 
@@ -453,8 +462,12 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
 
     let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm")).unwrap();
     let serial_num = client.rng().draw_word();
-    let note_script =
-        NoteScript::compile(note_code, assembler.with_library(&contract_lib).unwrap()).unwrap();
+
+    let note_script = ScriptBuilder::new(true)
+        .with_dynamically_linked_library(&contract_lib)
+        .unwrap()
+        .compile_note_script(note_code)
+        .unwrap();
 
     let p2id_withdraw_recipient: Word = withdraw_p2id_note.recipient().digest().into();
 
@@ -504,9 +517,8 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     // Wait for the withdrawal note to be available
     wait_for_note(
         &mut client,
-        None, // No specific account filter for network notes
+        &alice_account, // No specific account filter for network notes
         &withdrawal_note,
-        tx_result.executed_transaction().id(),
     )
     .await?;
 

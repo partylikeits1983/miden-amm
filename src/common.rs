@@ -8,60 +8,59 @@ use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 
 use miden_client::{
-    Client, ClientError, Felt, Word,
+    Client, ClientError, Felt, ScriptBuilder, Word,
     account::{
         Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageSlot,
-        component::{BasicFungibleFaucet, BasicWallet, RpoFalcon512},
+        component::{AuthRpoFalcon512, BasicFungibleFaucet, BasicWallet},
     },
     asset::{FungibleAsset, TokenSymbol},
     auth::AuthSecretKey,
     crypto::SecretKey,
     keystore::FilesystemKeyStore,
     note::{
-        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteScript,
-        NoteTag, NoteType,
+        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteTag,
+        NoteType,
     },
     transaction::{OutputNote, TransactionKernel, TransactionRequestBuilder},
 };
 use miden_objects::account::AccountComponent;
 use serde::de::value::Error;
 
-pub async fn create_basic_account(
-    client: &mut Client,
+// Helper to create a basic account
+async fn create_basic_account(
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
-) -> Result<(miden_client::account::Account, SecretKey), ClientError> {
-    let mut init_seed = [0_u8; 32];
+) -> Result<Account, ClientError> {
+    let mut init_seed = [0u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-
     let key_pair = SecretKey::with_rng(client.rng());
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Private)
-        .with_auth_component(RpoFalcon512::new(key_pair.public_key().clone()))
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
         .with_component(BasicWallet);
     let (account, seed) = builder.build().unwrap();
     client.add_account(&account, Some(seed), false).await?;
     keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair.clone()))
+        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
         .unwrap();
-
-    Ok((account, key_pair))
+    Ok(account)
 }
 
-pub async fn create_basic_faucet(
-    client: &mut Client,
+async fn create_basic_faucet(
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
 ) -> Result<miden_client::account::Account, ClientError> {
     let mut init_seed = [0u8; 32];
     client.rng().fill_bytes(&mut init_seed);
     let key_pair = SecretKey::with_rng(client.rng());
-    let symbol = TokenSymbol::new("MDN").unwrap();
+    let symbol = TokenSymbol::new("MID").unwrap();
     let decimals = 8;
-    let max_supply = Felt::new(1_000_000_000);
+    let max_supply = Felt::new(1_000_000);
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(RpoFalcon512::new(key_pair.public_key()))
+        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
         .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap());
     let (account, seed) = builder.build().unwrap();
     client.add_account(&account, Some(seed), false).await?;
@@ -76,7 +75,7 @@ pub async fn create_basic_faucet(
 /// - `balances[a][f]`: how many tokens faucet `f` should mint for account `a`.
 /// - Returns: a tuple of `(Vec<Account>, Vec<Account>)` i.e. (accounts, faucets).
 pub async fn setup_accounts_and_faucets(
-    client: &mut Client,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
     num_accounts: usize,
     num_faucets: usize,
@@ -87,7 +86,7 @@ pub async fn setup_accounts_and_faucets(
     // ---------------------------------------------------------------------
     let mut accounts = Vec::with_capacity(num_accounts);
     for i in 0..num_accounts {
-        let (account, _) = create_basic_account(client, keystore.clone()).await?;
+        let account = create_basic_account(client, keystore.clone()).await?;
         println!("Created Account #{i} ⇒ ID: {:?}", account.id().to_hex());
         accounts.push(account);
     }
@@ -169,7 +168,7 @@ pub async fn setup_accounts_and_faucets(
 }
 
 pub async fn wait_for_notes(
-    client: &mut Client,
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     account_id: &miden_client::account::Account,
     expected: usize,
 ) -> Result<(), ClientError> {
@@ -195,12 +194,9 @@ pub async fn create_amm_account(account_code: &str) -> Result<(Account, Word), E
     let counter_component = AccountComponent::compile(
         account_code.to_string(),
         assembler.clone(),
-        vec![StorageSlot::Value([
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-        ])],
+        vec![StorageSlot::Value(
+            [Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)].into(),
+        )],
     )
     .unwrap()
     .with_supports_all_types();
@@ -222,12 +218,14 @@ pub async fn create_amm_input_note(
     creator_account: Account,
     counter_contract_id: AccountId,
 ) -> Result<Note, Error> {
-    let assembler = TransactionKernel::assembler()
-        .with_library(&account_library)
-        .unwrap()
-        .with_debug_mode(true);
     let serial_num = Word::default();
-    let note_script = NoteScript::compile(note_code, assembler.clone()).unwrap();
+
+    let note_script = ScriptBuilder::new(true)
+        .with_dynamically_linked_library(&account_library)
+        .unwrap()
+        .compile_note_script(note_code)
+        .unwrap();
+
     let note_inputs = NoteInputs::new([].to_vec()).unwrap();
     let recipient = NoteRecipient::new(serial_num, note_script, note_inputs.clone());
 

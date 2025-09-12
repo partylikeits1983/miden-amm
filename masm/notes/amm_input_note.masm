@@ -2,8 +2,8 @@ use.external_contract::amm_contract
 use.std::sys
 
 begin
-    # 50_000 * 1e3
-    push.50000000
+    # 10_000 * 1e3
+    push.10000000
 
     # 100_000 * 1e3
     push.100000000
