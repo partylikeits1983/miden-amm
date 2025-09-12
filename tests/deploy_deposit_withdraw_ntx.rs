@@ -85,7 +85,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
 
     // Load the MASM file for the deposit_withdraw contract
-    let contract_path = Path::new("masm/accounts/deposit_withdraw.masm");
+    let contract_path = Path::new("masm/accounts/amm.masm");
     let contract_code = fs::read_to_string(contract_path).unwrap();
 
     let storage_map = StorageMap::new();

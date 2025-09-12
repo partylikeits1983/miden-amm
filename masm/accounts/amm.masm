@@ -22,6 +22,9 @@ const.DY_OUT = 0x0043
 const.DX_MUL_Y_BASE = 100
 const.DX_PLUS_Y = 104
 
+# Memory Addresses 
+const.DX_ASSET=200
+
 # ERRORS
 const.OVERFLOW="value larger than 32 bits"
 
@@ -119,16 +122,30 @@ export.deploy_contract
     # => []
 end
 
-# => [faucet_x_prefix, faucet_x_suffix, faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
+# => [DX_ASSET, faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
 export.swap
+
+    push.111 debug.stack drop
+
+    mem_storew.DX_ASSET
+
+    movup.2 drop movup.2 drop
+    # => [faucet_x_prefix, faucet_x_suffix]
+
+    push.222 debug.stack drop
+
     ### ____ AMM COMPUTATION ____
 
     # get balance faucet_id_in
     call.account::get_balance
     # => [token_x_balance, faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
 
+    push.333 debug.stack drop
+
     mem_store.POOL_X
     # => [faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
+
+    push.444 debug.stack drop
 
     # get balance faucet_id_out
     call.account::get_balance
@@ -137,17 +154,17 @@ export.swap
     mem_store.POOL_Y
     # => [OUPUT_NOTE]
 
-    push.0 exec.note::get_assets
-    # => [OUPUT_NOTE]
-
     mem_loadw.0
     # => [DX_ASSET, OUPUT_NOTE]
 
     drop drop drop
     # => [dx, OUPUT_NOTE]
 
-    # mem_store.DX_IN
+    mem_store.DX_IN
     # => [OUPUT_NOTE]
+
+    dropw
+    # => []
 
     mem_load.POOL_Y
     mem_load.POOL_X
@@ -155,6 +172,8 @@ export.swap
 
     exec.get_amount_y_out
     # => [dy]
+
+    push.555 debug.stack drop
 
     # => get asset amount in amount from input note
 
@@ -177,7 +196,6 @@ export.deposit
     # => [ASSET]
 
     push.222 debug.stack drop
-    push.3 mem_loadw
 
     dupw
     # => [ASSET, ASSET]

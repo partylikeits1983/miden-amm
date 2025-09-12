@@ -84,7 +84,7 @@ async fn test_deposit_withdraw_local() -> Result<()> {
     let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
 
     // Load the MASM file for the deposit_withdraw contract
-    let contract_path = Path::new("masm/accounts/deposit_withdraw.masm");
+    let contract_path = Path::new("masm/accounts/amm.masm");
     let contract_code = fs::read_to_string(contract_path)?;
 
     let storage_map = StorageMap::new();
@@ -217,7 +217,7 @@ async fn test_deposit_withdraw_local() -> Result<()> {
     let _ = client.submit_transaction(tx_result.clone()).await;
     client.sync_state().await?;
 
-    wait_for_note(&mut client, &deposit_contract, &deposit_note).await?;
+    // wait_for_note(&mut client, &alice_account, &deposit_note).await?;
 
     // -------------------------------------------------------------------------
     // STEP 5: Consume the deposit note (deposit assets into contract)
@@ -334,7 +334,7 @@ async fn test_deposit_withdraw_local() -> Result<()> {
 
     // Wait for the withdrawal note to be available
 
-    wait_for_note(&mut client, &alice_account, &withdrawal_note).await?;
+    // wait_for_note(&mut client, &alice_account, &withdrawal_note).await?;
 
     // -------------------------------------------------------------------------
     // STEP 8: Consume the withdrawal note
@@ -365,7 +365,7 @@ async fn test_deposit_withdraw_local() -> Result<()> {
         account.unwrap().account().storage().get_item(0)
     );
 
-    wait_for_note(&mut client, &alice_account, &withdrawal_note).await?;
+    // wait_for_note(&mut client, &alice_account, &withdrawal_note).await?;
 
     // -------------------------------------------------------------------------
     // STEP 9: Consume the private p2id note

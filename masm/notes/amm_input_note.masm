@@ -1,20 +1,33 @@
 use.external_contract::amm_contract
+use.miden::note
 use.std::sys
 
 begin
     # 10_000 * 1e3
-    push.10000000
+    #push.10000000
 
     # 100_000 * 1e3
-    push.100000000
-    push.100000000
+    #push.100000000
+    #push.100000000
     # => [x, y, dx]
 
     # returns fixed point base 1e3
-    call.amm_contract::get_amount_y_out
+    # call.amm_contract::get_amount_y_out
     # => [dy]
 
-    push.111 debug.stack drop
+    dropw
+    # => []
+
+    # get inputs
+    push.0 exec.note::get_inputs
+
+    mem_loadw.0
+    # => [faucet_y_prefix, faucet_y_suffix]
+
+    push.0 exec.note::get_assets mem_loadw.0
+
+
+    call.amm_contract::swap
 
     exec.sys::truncate_stack
 end
