@@ -281,7 +281,7 @@ async fn amm_local_test() -> Result<()> {
         Felt::new(0),
     )?;
     let deposit_amount_b = FungibleAsset::new(faucet_b_id, 100).unwrap();
-    let vault_b = NoteAssets::new(vec![mint_amount_b.into()])?;
+    let vault_b = NoteAssets::new(vec![deposit_amount_b.into()])?;
     let deposit_note_b = Note::new(vault_b, metadata_b, recipient_b);
     println!("deposit note B hash: {:?}", deposit_note_b.id().to_hex());
 
@@ -362,6 +362,31 @@ async fn amm_local_test() -> Result<()> {
     );
 
     // -------------------------------------------------------------------------
+    // [STEP 6] Create P2ID output note for Alice
+    // -------------------------------------------------------------------------
+
+    println!("\n[STEP 6] Create P2ID withdraw note for Alice");
+
+    let output_asset = FungibleAsset::new(faucet_a_id, 9)?;
+
+    // Create a P2ID note with the same asset amount, targeted to Alice
+    let amm_output_p2id_note = create_p2id_note(
+        amm_contract.id(),         // sender (the contract)
+        alice_account_id,          // target (Alice)
+        vec![output_asset.into()], // same asset that was deposited
+        NoteType::Private,
+        Felt::new(0),
+        client.rng(),
+    )
+    .unwrap();
+
+    println!(
+        "Withdraw P2ID note id: {:?}",
+        amm_output_p2id_note.id().to_hex()
+    );
+    println!("Withdraw note assets: {:?}", amm_output_p2id_note.assets());
+
+    // -------------------------------------------------------------------------
     // STEP 6: Create AMM input note
     // -------------------------------------------------------------------------
     println!("\n[STEP 6] Create AMM input note");
@@ -389,7 +414,33 @@ async fn amm_local_test() -> Result<()> {
         .compile_note_script(amm_note_code)
         .unwrap();
 
-    let amm_note_inputs = NoteInputs::new(vec![faucet_b_id.suffix(), faucet_b_id.prefix().into()])?; // No special inputs needed
+    let output_note_details_word: Word = [
+        amm_output_p2id_note.metadata().execution_hint().into(),
+        amm_output_p2id_note.metadata().note_type().into(),
+        amm_output_p2id_note.metadata().aux(),
+        amm_output_p2id_note.metadata().tag().into(),
+    ]
+    .into();
+
+    let output_note_recipient: Word = amm_output_p2id_note.recipient().digest();
+
+    let amm_note_inputs = NoteInputs::new(vec![
+        faucet_b_id.suffix(),
+        faucet_b_id.prefix().into(),
+        Felt::new(0),
+        Felt::new(0),
+        output_note_recipient[0],
+        output_note_recipient[1],
+        output_note_recipient[2],
+        output_note_recipient[3],
+        output_note_details_word[0],
+        output_note_details_word[1],
+        output_note_details_word[2],
+        output_note_details_word[3],
+    ])?;
+
+    println!("amm note inputs: {:?}", amm_note_inputs);
+
     let amm_recipient = NoteRecipient::new(serial_num_amm, amm_note_script, amm_note_inputs);
     let amm_tag = NoteTag::for_public_use_case(0, 0, NoteExecutionMode::Local)?;
     let amm_metadata = NoteMetadata::new(

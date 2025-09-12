@@ -22,10 +22,9 @@ begin
     push.0 exec.note::get_inputs
 
     mem_loadw.0
-    # => [faucet_y_prefix, faucet_y_suffix]
+    # => [faucet_y_prefix, faucet_y_suffix, 0, 0]
 
     push.0 exec.note::get_assets mem_loadw.0
-
 
     call.amm_contract::swap
 
