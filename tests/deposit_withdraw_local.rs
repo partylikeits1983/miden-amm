@@ -13,7 +13,7 @@ use miden_client::{
     account::{
         Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType,
         Address, AddressInterface, StorageMap, StorageSlot,
-        component::{BasicFungibleFaucet, RpoFalcon512},
+        component::{BasicFungibleFaucet},
     },
     asset::{FungibleAsset, TokenSymbol},
     auth::AuthSecretKey,

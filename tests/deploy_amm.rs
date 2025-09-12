@@ -1,39 +1,20 @@
 use miden_lib::account::auth::NoAuth;
 use rand::RngCore;
 use std::{fs, path::Path, sync::Arc};
+use miden_amm::common::create_library_with_assembler;
 
-use miden_assembly::{
-    LibraryPath,
-    ast::{Module, ModuleKind},
-};
 use miden_client::{
     ClientError, Felt, ScriptBuilder,
     account::{AccountBuilder, AccountStorageMode, AccountType, StorageSlot},
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
     rpc::{Endpoint, TonicRpcClient},
-    transaction::{TransactionKernel, TransactionRequestBuilder, TransactionScript},
+    transaction::{TransactionKernel, TransactionRequestBuilder},
 };
 use miden_objects::{
-    account::{AccountComponent, NetworkId},
+    account::{AccountComponent},
     assembly::Assembler,
-    assembly::DefaultSourceManager,
 };
-
-fn create_library(
-    assembler: Assembler,
-    library_path: &str,
-    source_code: &str,
-) -> Result<miden_assembly::Library, Box<dyn std::error::Error>> {
-    let source_manager = Arc::new(DefaultSourceManager::default());
-    let module = Module::parser(ModuleKind::Library).parse_str(
-        LibraryPath::new(library_path)?,
-        source_code,
-        &source_manager,
-    )?;
-    let library = assembler.clone().assemble_library([module])?;
-    Ok(library)
-}
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
@@ -112,7 +93,7 @@ async fn main() -> Result<(), ClientError> {
     let script_code = fs::read_to_string(script_path).unwrap();
 
     let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
-    let account_component_lib = create_library(
+    let account_component_lib = create_library_with_assembler(
         assembler.clone(),
         "external_contract::amm_script",
         &counter_code,

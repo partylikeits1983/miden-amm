@@ -10,7 +10,8 @@ use tokio::time::{Duration, sleep};
 use miden_client::{
     Client, ClientError, Felt, ScriptBuilder, Word,
     account::{
-        Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageSlot,
+        Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType, StorageSlot,
+        Address, AddressInterface,
         component::{AuthRpoFalcon512, BasicFungibleFaucet, BasicWallet},
     },
     asset::{FungibleAsset, TokenSymbol},
@@ -18,16 +19,17 @@ use miden_client::{
     crypto::SecretKey,
     keystore::FilesystemKeyStore,
     note::{
-        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteTag,
+        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteRelevance, NoteTag,
         NoteType,
     },
-    transaction::{OutputNote, TransactionKernel, TransactionRequestBuilder},
+    store::{InputNoteRecord, TransactionFilter},
+    transaction::{OutputNote, TransactionId, TransactionKernel, TransactionRequestBuilder, TransactionStatus},
 };
-use miden_objects::account::AccountComponent;
+use miden_objects::{account::{AccountComponent, NetworkId}, testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2};
 use serde::de::value::Error;
 
 // Helper to create a basic account
-async fn create_basic_account(
+pub async fn create_basic_account(
     client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
 ) -> Result<Account, ClientError> {
@@ -47,7 +49,7 @@ async fn create_basic_account(
     Ok(account)
 }
 
-async fn create_basic_faucet(
+pub async fn create_basic_faucet(
     client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
     keystore: FilesystemKeyStore<StdRng>,
 ) -> Result<miden_client::account::Account, ClientError> {
@@ -257,4 +259,77 @@ pub fn create_library(
     )?;
     let library = assembler.clone().assemble_library([module])?;
     Ok(library)
+}
+
+// Alternative create_library function with assembler parameter (used in some tests)
+pub fn create_library_with_assembler(
+    assembler: Assembler,
+    library_path: &str,
+    source_code: &str,
+) -> Result<Library, Box<dyn std::error::Error>> {
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let module = Module::parser(ModuleKind::Library).parse_str(
+        LibraryPath::new(library_path)?,
+        source_code,
+        &source_manager,
+    )?;
+    let library = assembler.clone().assemble_library([module])?;
+    Ok(library)
+}
+
+/// Waits for a specific note to become available in the client's state.
+pub async fn wait_for_note(
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
+    account_id: &Account,
+    expected: &Note,
+) -> Result<(), ClientError> {
+    loop {
+        client.sync_state().await?;
+
+        let notes: Vec<(InputNoteRecord, Vec<(AccountId, NoteRelevance)>)> =
+            client.get_consumable_notes(Some(account_id.id())).await?;
+
+        let found = notes.iter().any(|(rec, _)| rec.id() == expected.id());
+
+        if found {
+            println!("✅ note found {}", expected.id().to_hex());
+            break;
+        }
+
+        println!("Note {} not found. Waiting...", expected.id().to_hex());
+        sleep(Duration::from_secs(3)).await;
+    }
+    Ok(())
+}
+
+/// Waits for a specific transaction to be committed.
+pub async fn wait_for_tx(
+    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
+    tx_id: TransactionId,
+) -> Result<(), ClientError> {
+    loop {
+        client.sync_state().await?;
+
+        // Check transaction status
+        let txs = client
+            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
+            .await?;
+        let tx_committed = if !txs.is_empty() {
+            matches!(txs[0].status, TransactionStatus::Committed { .. })
+        } else {
+            false
+        };
+
+        if tx_committed {
+            println!("✅ transaction {} committed", tx_id.to_hex());
+            break;
+        }
+
+        println!(
+            "Transaction {} not yet committed. Waiting...",
+            tx_id.to_hex()
+        );
+        sleep(Duration::from_secs(2)).await;
+    }
+    Ok(())
 }

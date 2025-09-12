@@ -15,7 +15,7 @@ use miden_objects::{
 
 #[test]
 fn p2id_script_multiple_assets() -> anyhow::Result<()> {
-    let mut mock_chain = MockChain::new();
+    let mut builder = MockChain::builder();
 
     // Create assets
     let fungible_asset_1: Asset = FungibleAsset::mock(123);
@@ -25,19 +25,18 @@ fn p2id_script_multiple_assets() -> anyhow::Result<()> {
             .into();
 
     // Create sender and target account
-    let sender_account = mock_chain.add_pending_new_wallet(Auth::BasicAuth);
-    let target_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
+    let sender_account = builder.add_existing_wallet(Auth::BasicAuth)?;
+    let target_account = builder.add_existing_wallet(Auth::BasicAuth)?;
 
     // Create the note
-    let _note = mock_chain
-        .add_pending_p2id_note(
-            sender_account.id(),
-            target_account.id(),
-            &[fungible_asset_1, fungible_asset_2],
-            NoteType::Public,
-        )
-        .unwrap();
+    let _note = builder.add_p2id_note(
+        sender_account.id(),
+        target_account.id(),
+        &[fungible_asset_1, fungible_asset_2],
+        NoteType::Public,
+    )?;
 
+    let mut mock_chain = builder.build()?;
     mock_chain.prove_next_block()?;
 
     Ok(())
@@ -45,8 +44,7 @@ fn p2id_script_multiple_assets() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn amm_test() -> anyhow::Result<()> {
-    let mut mock_chain = MockChain::new();
-    mock_chain.prove_until_block(1u32)?;
+    let mut builder = MockChain::builder();
 
     // Initialize assets & accounts
     let _asset_a: Asset =
@@ -58,11 +56,8 @@ async fn amm_test() -> anyhow::Result<()> {
             .unwrap()
             .into();
 
-    // Create sender and target and malicious account
-    let alice_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
-    let _bob_account = mock_chain.add_pending_existing_wallet(Auth::BasicAuth, vec![]);
-
-    mock_chain.add_pending_account(alice_account.clone());
+    // Create alice account for the note creation
+    let alice_account = builder.add_existing_wallet(Auth::BasicAuth)?;
 
     // Load the MASM file for the counter contract
     let counter_path = Path::new("masm/accounts/amm_account.masm");
@@ -70,21 +65,21 @@ async fn amm_test() -> anyhow::Result<()> {
 
     let (amm_account, account_seed) = create_amm_account(&counter_code).await?;
 
-    mock_chain.add_pending_account(amm_account.clone());
-    mock_chain.prove_next_block()?;
-
     let note_code = fs::read_to_string(Path::new("masm/notes/amm_input_note.masm")).unwrap();
     let account_code = fs::read_to_string(Path::new("masm/accounts/amm_account.masm")).unwrap();
 
     let library_path = "external_contract::amm_contract";
     let library = create_library(account_code, library_path).unwrap();
 
-    let amm_input_note = create_amm_input_note(note_code, library, alice_account, amm_account.id())
+    let amm_input_note = create_amm_input_note(note_code, library, alice_account.clone(), amm_account.id())
         .await
         .unwrap();
 
-    mock_chain.add_pending_note(OutputNote::Full(amm_input_note.clone()));
-    mock_chain.prove_next_block()?;
+    // Add the note to the builder
+    builder.add_note(OutputNote::Full(amm_input_note.clone()));
+    
+    // Build the mock chain
+    let mock_chain = builder.build()?;
 
     let tx_inputs = mock_chain.get_transaction_inputs(
         amm_account.clone(),
@@ -92,12 +87,12 @@ async fn amm_test() -> anyhow::Result<()> {
         &[amm_input_note.id()],
         &[],
     )?;
+    
     let tx_context = TransactionContextBuilder::new(amm_account.clone())
+        .account_seed(Some(account_seed))
         .tx_inputs(tx_inputs)
         .build()?;
-    let executed_transaction = tx_context.execute().await?;
-
-    let _target_account = mock_chain.add_pending_executed_transaction(&executed_transaction)?;
+    let _executed_transaction = tx_context.execute().await?;
 
     Ok(())
 }

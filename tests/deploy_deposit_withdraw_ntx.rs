@@ -15,7 +15,7 @@ use miden_client::{
     account::{
         Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType,
         Address, AddressInterface, StorageMap, StorageSlot,
-        component::{BasicFungibleFaucet, RpoFalcon512},
+        component::{BasicFungibleFaucet},
     },
     asset::{FungibleAsset, TokenSymbol},
     auth::AuthSecretKey,
@@ -91,7 +91,7 @@ async fn create_basic_faucet(
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(RpoFalcon512::new(key_pair.public_key()))
+        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
         .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap());
     let (account, seed) = builder.build().unwrap();
     client.add_account(&account, Some(seed), false).await?;
@@ -166,11 +166,11 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let timeout_ms = 10_000;
     let rpc_api = Arc::new(TonicRpcClient::new(&endpoint, timeout_ms));
 
-    let keystore = FilesystemKeyStore::new("./keystore".into()).unwrap().into();
+    let keystore = Arc::new(FilesystemKeyStore::new("./keystore".into()).unwrap());
 
     let mut client = ClientBuilder::new()
         .rpc(rpc_api)
-        .authenticator(keystore)
+        .authenticator(keystore.clone())
         .in_debug_mode(true.into())
         .build()
         .await?;
@@ -182,7 +182,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     // STEP 1: Create accounts and deploy faucet
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Creating new accounts");
-    let alice_account = create_basic_account(&mut client, keystore).await?;
+    let alice_account = create_basic_account(&mut client, (*keystore).clone()).await?;
     let alice_account_id = alice_account.id();
     println!(
         "Alice's account ID: {:?}",
@@ -194,7 +194,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     );
 
     println!("\nDeploying a new fungible faucet.");
-    let faucet = create_basic_faucet(&mut client, keystore).await?;
+    let faucet = create_basic_faucet(&mut client, (*keystore).clone()).await?;
     println!(
         "Faucet account ID: {:?}",
         Address::from(AccountIdAddress::new(
