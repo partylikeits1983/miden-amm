@@ -1,163 +1,34 @@
-use miden_lib::{
-    account::{auth::AuthRpoFalcon512, wallets::BasicWallet},
-    errors::note_script_errors,
+use miden_amm::common::{
+    create_basic_account, create_basic_faucet, create_library_with_assembler, wait_for_note,
+    wait_for_tx,
 };
-use rand::{RngCore, rngs::StdRng};
+use rand::RngCore;
 use std::{fs, path::Path, sync::Arc};
 use tokio::time::{Duration, sleep};
 
-use miden_assembly::{
-    LibraryPath,
-    ast::{Module, ModuleKind},
-};
 use miden_client::{
-    Client, ClientError, Felt, Word,
+    Felt, Word,
     account::{
-        Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType,
-        Address, AddressInterface, StorageMap, StorageSlot,
-        component::{BasicFungibleFaucet},
+        AccountBuilder, AccountIdAddress, AccountStorageMode, AccountType, Address,
+        AddressInterface, StorageMap, StorageSlot, component::BasicWallet,
     },
-    asset::{FungibleAsset, TokenSymbol},
-    auth::AuthSecretKey,
+    asset::FungibleAsset,
     builder::ClientBuilder,
-    crypto::{FeltRng, SecretKey},
+    crypto::FeltRng,
     keystore::FilesystemKeyStore,
     note::{
-        Note, NoteAssets, NoteExecutionHint, NoteExecutionMode, NoteInputs, NoteMetadata,
-        NoteRecipient, NoteRelevance, NoteScript, NoteTag, NoteType, create_p2id_note,
+        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteTag,
+        NoteType, create_p2id_note,
     },
     rpc::{Endpoint, TonicRpcClient},
-    store::{InputNoteRecord, NoteFilter, TransactionFilter},
-    transaction::{
-        OutputNote, TransactionId, TransactionKernel, TransactionRequestBuilder, TransactionStatus,
-    },
+    transaction::{OutputNote, TransactionKernel, TransactionRequestBuilder},
 };
 use miden_lib::account::auth::NoAuth;
 use miden_lib::utils::ScriptBuilder;
 use miden_objects::{
     account::{AccountComponent, NetworkId},
     assembly::Assembler,
-    assembly::DefaultSourceManager,
 };
-
-fn create_library(
-    assembler: Assembler,
-    library_path: &str,
-    source_code: &str,
-) -> Result<miden_assembly::Library, Box<dyn std::error::Error>> {
-    let source_manager = Arc::new(DefaultSourceManager::default());
-    let module = Module::parser(ModuleKind::Library).parse_str(
-        LibraryPath::new(library_path)?,
-        source_code,
-        &source_manager,
-    )?;
-    let library = assembler.clone().assemble_library([module])?;
-    Ok(library)
-}
-
-// Helper to create a basic account
-async fn create_basic_account(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    keystore: FilesystemKeyStore<StdRng>,
-) -> Result<miden_client::account::Account, ClientError> {
-    let mut init_seed = [0_u8; 32];
-    client.rng().fill_bytes(&mut init_seed);
-
-    let key_pair = SecretKey::with_rng(client.rng());
-    let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
-        .with_component(BasicWallet);
-    let (account, seed) = builder.build().unwrap();
-    client.add_account(&account, Some(seed), false).await?;
-    keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
-        .unwrap();
-
-    Ok(account)
-}
-
-async fn create_basic_faucet(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    keystore: FilesystemKeyStore<StdRng>,
-) -> Result<Account, ClientError> {
-    let mut init_seed = [0u8; 32];
-    client.rng().fill_bytes(&mut init_seed);
-    let key_pair = SecretKey::with_rng(client.rng());
-    let symbol = TokenSymbol::new("MID").unwrap();
-    let decimals = 8;
-    let max_supply = Felt::new(1_000_000);
-    let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::FungibleFaucet)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
-        .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap());
-    let (account, seed) = builder.build().unwrap();
-    client.add_account(&account, Some(seed), false).await?;
-    keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
-        .unwrap();
-    Ok(account)
-}
-
-/// Waits for a specific transaction to be committed.
-pub async fn wait_for_note(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    account_id: &Account,
-    expected: &Note,
-) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        let notes: Vec<(InputNoteRecord, Vec<(AccountId, NoteRelevance)>)> =
-            client.get_consumable_notes(Some(account_id.id())).await?;
-
-        let found = notes.iter().any(|(rec, _)| rec.id() == expected.id());
-
-        if found {
-            println!("✅ note found {}", expected.id().to_hex());
-            break;
-        }
-
-        println!("Note {} not found. Waiting...", expected.id().to_hex());
-        sleep(Duration::from_secs(3)).await;
-    }
-    Ok(())
-}
-
-/// Waits for a specific transaction to be committed.
-/// Waits for a specific transaction to be committed.
-async fn wait_for_tx(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    tx_id: TransactionId,
-) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed { .. })
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ transaction {} committed", tx_id.to_hex());
-            break;
-        }
-
-        println!(
-            "Transaction {} not yet committed. Waiting...",
-            tx_id.to_hex()
-        );
-        sleep(Duration::from_secs(2)).await;
-    }
-    Ok(())
-}
 
 #[tokio::test]
 async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Error>> {
@@ -270,7 +141,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     .unwrap();
 
     let library_path = "external_contract::deposit_withdraw_contract";
-    let contract_lib = create_library(
+    let contract_lib = create_library_with_assembler(
         TransactionKernel::assembler().with_debug_mode(true),
         library_path,
         &contract_code,
@@ -349,7 +220,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let assembler = TransactionKernel::assembler().with_debug_mode(true);
 
     // Create library from the deposit contract code so the note can call its procedures
-    let contract_lib = create_library(
+    let contract_lib = create_library_with_assembler(
         assembler.clone(),
         "external_contract::deposit_withdraw_contract",
         &contract_code,
@@ -453,7 +324,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let assembler = TransactionKernel::assembler().with_debug_mode(true);
 
     // Create library from the deposit contract code so the note can call its procedures
-    let contract_lib = create_library(
+    let contract_lib = create_library_with_assembler(
         assembler.clone(),
         "external_contract::deposit_withdraw_contract",
         &contract_code,

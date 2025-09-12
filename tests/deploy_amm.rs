@@ -1,7 +1,7 @@
+use miden_amm::common::create_library_with_assembler;
 use miden_lib::account::auth::NoAuth;
 use rand::RngCore;
 use std::{fs, path::Path, sync::Arc};
-use miden_amm::common::create_library_with_assembler;
 
 use miden_client::{
     ClientError, Felt, ScriptBuilder,
@@ -11,10 +11,7 @@ use miden_client::{
     rpc::{Endpoint, TonicRpcClient},
     transaction::{TransactionKernel, TransactionRequestBuilder},
 };
-use miden_objects::{
-    account::{AccountComponent},
-    assembly::Assembler,
-};
+use miden_objects::{account::AccountComponent, assembly::Assembler};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {

@@ -71,13 +71,14 @@ async fn amm_test() -> anyhow::Result<()> {
     let library_path = "external_contract::amm_contract";
     let library = create_library(account_code, library_path).unwrap();
 
-    let amm_input_note = create_amm_input_note(note_code, library, alice_account.clone(), amm_account.id())
-        .await
-        .unwrap();
+    let amm_input_note =
+        create_amm_input_note(note_code, library, alice_account.clone(), amm_account.id())
+            .await
+            .unwrap();
 
     // Add the note to the builder
     builder.add_note(OutputNote::Full(amm_input_note.clone()));
-    
+
     // Build the mock chain
     let mock_chain = builder.build()?;
 
@@ -87,7 +88,7 @@ async fn amm_test() -> anyhow::Result<()> {
         &[amm_input_note.id()],
         &[],
     )?;
-    
+
     let tx_context = TransactionContextBuilder::new(amm_account.clone())
         .account_seed(Some(account_seed))
         .tx_inputs(tx_inputs)

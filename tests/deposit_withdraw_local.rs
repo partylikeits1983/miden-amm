@@ -1,154 +1,33 @@
 use anyhow::Result;
-use miden_lib::account::{auth::AuthRpoFalcon512, wallets::BasicWallet};
-use rand::{RngCore, rngs::StdRng};
-use std::{fs, path::Path, sync::Arc};
-use tokio::time::{Duration, sleep};
-
-use miden_assembly::{
-    LibraryPath,
-    ast::{Module, ModuleKind},
+use miden_amm::common::{
+    create_basic_account, create_basic_faucet, create_library_with_assembler, wait_for_note,
 };
+use rand::RngCore;
+use std::{fs, path::Path, sync::Arc};
+
 use miden_client::{
-    Client, ClientError, Felt, ScriptBuilder, Word,
+    Felt, ScriptBuilder, Word,
     account::{
-        Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType,
-        Address, AddressInterface, StorageMap, StorageSlot,
-        component::{BasicFungibleFaucet},
+        AccountBuilder, AccountIdAddress, AccountStorageMode, AccountType, Address,
+        AddressInterface, StorageMap, StorageSlot, component::BasicWallet,
     },
-    asset::{FungibleAsset, TokenSymbol},
+    asset::FungibleAsset,
     auth::AuthSecretKey,
     builder::ClientBuilder,
     crypto::{FeltRng, SecretKey},
     keystore::FilesystemKeyStore,
     note::{
         Note, NoteAssets, NoteExecutionHint, NoteExecutionMode, NoteInputs, NoteMetadata,
-        NoteRecipient, NoteRelevance, NoteScript, NoteTag, NoteType, create_p2id_note,
+        NoteRecipient, NoteTag, NoteType, create_p2id_note,
     },
     rpc::{Endpoint, TonicRpcClient},
-    store::{InputNoteRecord, NoteFilter, TransactionFilter},
-    transaction::{
-        OutputNote, TransactionId, TransactionKernel, TransactionRequestBuilder, TransactionStatus,
-    },
+    transaction::{OutputNote, TransactionKernel, TransactionRequestBuilder},
 };
 use miden_lib::account::auth::NoAuth;
 use miden_objects::{
     account::{AccountComponent, NetworkId},
     assembly::Assembler,
-    assembly::DefaultSourceManager,
 };
-
-fn create_library(
-    assembler: Assembler,
-    library_path: &str,
-    source_code: &str,
-) -> Result<miden_assembly::Library> {
-    let source_manager = Arc::new(DefaultSourceManager::default());
-    let module = Module::parser(ModuleKind::Library)
-        .parse_str(
-            LibraryPath::new(library_path)
-                .map_err(|e| anyhow::anyhow!("Failed to create library path: {}", e))?,
-            source_code,
-            &source_manager,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to parse module: {}", e))?;
-    let library = assembler
-        .clone()
-        .assemble_library([module])
-        .map_err(|e| anyhow::anyhow!("Failed to assemble library: {}", e))?;
-    Ok(library)
-}
-
-// Helper to create a basic account
-async fn create_basic_account(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    keystore: FilesystemKeyStore<StdRng>,
-) -> Result<miden_client::account::Account, ClientError> {
-    let mut init_seed = [0_u8; 32];
-    client.rng().fill_bytes(&mut init_seed);
-
-    let key_pair = SecretKey::with_rng(client.rng());
-    let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
-        .with_component(BasicWallet);
-    let (account, seed) = builder.build().unwrap();
-    client.add_account(&account, Some(seed), false).await?;
-    keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
-        .unwrap();
-
-    Ok(account)
-}
-
-async fn create_basic_faucet(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    keystore: FilesystemKeyStore<StdRng>,
-) -> Result<miden_client::account::Account, ClientError> {
-    let mut init_seed = [0u8; 32];
-    client.rng().fill_bytes(&mut init_seed);
-    let key_pair = SecretKey::with_rng(client.rng());
-    let symbol = TokenSymbol::new("MID").unwrap();
-    let decimals = 8;
-    let max_supply = Felt::new(1_000_000);
-    let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::FungibleFaucet)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(key_pair.public_key()))
-        .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap());
-    let (account, seed) = builder.build().unwrap();
-    client.add_account(&account, Some(seed), false).await?;
-    keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
-        .unwrap();
-    Ok(account)
-}
-
-/// Waits for a specific note to become available in the client's state and checks transaction commitment.
-///
-/// This function continuously polls the client's state until the expected note
-/// is found either in the consumable notes or committed notes. It also checks if the
-/// associated transaction has been committed. It uses a 2-second polling interval.
-///
-/// # Arguments
-///
-/// * `client` - A mutable reference to the Miden client
-/// * `account_id` - An optional account to filter consumable notes by
-/// * `expected` - A reference to the note we're waiting for
-/// * `tx_id` - The transaction ID to check for commitment status
-///
-/// # Returns
-///
-/// Returns `Ok(())` when the note is found and transaction is committed, or a `ClientError` if synchronization fails.
-///
-/// # Behavior
-///
-/// The function will loop indefinitely until the note is found and the transaction is committed,
-/// printing status messages every 2 seconds. It checks both consumable and committed note collections
-/// as well as transaction commitment status.
-pub async fn wait_for_note(
-    client: &mut Client<FilesystemKeyStore<rand::prelude::StdRng>>,
-    account_id: &Account,
-    expected: &Note,
-) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        let notes: Vec<(InputNoteRecord, Vec<(AccountId, NoteRelevance)>)> =
-            client.get_consumable_notes(Some(account_id.id())).await?;
-
-        let found = notes.iter().any(|(rec, _)| rec.id() == expected.id());
-
-        if found {
-            println!("✅ note found {}", expected.id().to_hex());
-            break;
-        }
-
-        println!("Note {} not found. Waiting...", expected.id().to_hex());
-        sleep(Duration::from_secs(3)).await;
-    }
-    Ok(())
-}
 
 #[tokio::test]
 async fn test_deposit_withdraw_local() -> Result<()> {
@@ -295,11 +174,12 @@ async fn test_deposit_withdraw_local() -> Result<()> {
     let assembler = TransactionKernel::assembler().with_debug_mode(true);
 
     // Create library from the deposit contract code so the note can call its procedures
-    let contract_lib = create_library(
+    let contract_lib = create_library_with_assembler(
         assembler.clone(),
         "external_contract::deposit_withdraw_contract",
         &contract_code,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to create library: {}", e))?;
 
     let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm"))?;
     let serial_num = client.rng().draw_word();
@@ -397,11 +277,12 @@ async fn test_deposit_withdraw_local() -> Result<()> {
     let assembler = TransactionKernel::assembler().with_debug_mode(true);
 
     // Create library from the deposit contract code so the note can call its procedures
-    let contract_lib = create_library(
+    let contract_lib = create_library_with_assembler(
         assembler.clone(),
         "external_contract::deposit_withdraw_contract",
         &contract_code,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to create library: {}", e))?;
 
     let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm"))?;
     let serial_num = client.rng().draw_word();

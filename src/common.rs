@@ -10,8 +10,7 @@ use tokio::time::{Duration, sleep};
 use miden_client::{
     Client, ClientError, Felt, ScriptBuilder, Word,
     account::{
-        Account, AccountBuilder, AccountId, AccountIdAddress, AccountStorageMode, AccountType, StorageSlot,
-        Address, AddressInterface,
+        Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageSlot,
         component::{AuthRpoFalcon512, BasicFungibleFaucet, BasicWallet},
     },
     asset::{FungibleAsset, TokenSymbol},
@@ -19,13 +18,15 @@ use miden_client::{
     crypto::SecretKey,
     keystore::FilesystemKeyStore,
     note::{
-        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient, NoteRelevance, NoteTag,
-        NoteType,
+        Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient,
+        NoteRelevance, NoteTag, NoteType,
     },
     store::{InputNoteRecord, TransactionFilter},
-    transaction::{OutputNote, TransactionId, TransactionKernel, TransactionRequestBuilder, TransactionStatus},
+    transaction::{
+        OutputNote, TransactionId, TransactionKernel, TransactionRequestBuilder, TransactionStatus,
+    },
 };
-use miden_objects::{account::{AccountComponent, NetworkId}, testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2};
+use miden_objects::account::AccountComponent;
 use serde::de::value::Error;
 
 // Helper to create a basic account
