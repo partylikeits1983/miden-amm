@@ -151,6 +151,8 @@ export.swap
     call.account::get_balance
     # => [token_y_balance]
 
+    push.555 debug.stack drop
+
     mem_store.POOL_Y
     # => [OUPUT_NOTE]
 
@@ -160,15 +162,14 @@ export.swap
     drop drop drop
     # => [dx, OUPUT_NOTE]
 
-    mem_store.DX_IN
-    # => [OUPUT_NOTE]
-
-    dropw
-    # => []
+    dup mem_store.DX_IN
+    
 
     mem_load.POOL_Y
     mem_load.POOL_X
     # => [x, y, dx, OUTPUT_NOTE]
+
+    push.404 debug.stack drop
 
     exec.get_amount_y_out
     # => [dy]
