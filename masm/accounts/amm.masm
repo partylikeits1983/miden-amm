@@ -29,6 +29,8 @@ const.ASSET_OUT=212
 # ERRORS
 const.OVERFLOW="value larger than 32 bits"
 
+const.ERR_SLIPPAGE="slippage higher than user set accepted range"
+
 const.BALANCES_SLOT=0
 
 # AMM CALCULATION
@@ -130,70 +132,82 @@ export.swap
     movup.2 drop movup.2 drop
     # => [asset_in_prefix, asset_in_suffix, ASSET_OUT]
 
-    ### ____ AMM COMPUTATION ____
+    # AMM computation
 
     # get balance faucet_id_in
     call.account::get_balance
     # => [pool_x_balance, ASSET_OUT]
 
-    push.333 debug.stack drop
-    
     mem_store.POOL_X
-    # => [asset_in_prefix, asset_in_suffix, ASSET_OUT]
-
-    push.0 movdn.2 push.0 movdn.2
+    # => [ASSET_OUT]
 
     mem_storew.ASSET_OUT
-    # => [asset_out_prefix, asset_out_suffix, OUPUT_NOTE]
+    # => [ASSET_OUT]
 
-    push.444 debug.stack drop swap
+    movup.2 drop movup.2 drop
+    # => [asset_out_prefix, asset_out_suffix]
 
     # get balance faucet_id_out
     call.account::get_balance
     # => [asset_out_balance]
 
-    push.555 debug.stack drop
-
     mem_store.POOL_Y
-    # => [OUPUT_NOTE]
+    # => []
 
     mem_loadw.ASSET_IN
-    # => [ASSET_IN, OUPUT_NOTE]
+    # => [ASSET_IN]
 
     drop drop drop
-    # => [dx, OUPUT_NOTE]
+    # => [dx]
 
     dup mem_store.DX_IN
-
     mem_load.POOL_Y
     mem_load.POOL_X
-    # => [x, y, dx, OUTPUT_NOTE]
+    # => [x, y, dx]
 
     exec.get_amount_y_out
     # => [dy]
 
-    mem_store.DY_OUT
+    dup mem_store.DY_OUT
+    # => [dy]
+
+    # checking acceptable slippage
+
+    padw mem_loadw.ASSET_OUT drop drop drop
+    # => [min_requested_out, dy]
+
+    gte assert.err=ERR_SLIPPAGE
     # => []
+
+    # consume ASSET_IN
 
     mem_loadw.ASSET_IN
+    # => [ASSET_IN]
 
-    call.wallet::receive_asset
+    call.wallet::receive_asset dropw
     # => []
 
-    push.0 exec.note::get_inputs drop
+    # create requested output note
 
-    mem_loadw.4 padw mem_loadw.8
+    push.0 exec.note::get_inputs drop
+    # => []
+
+    mem_loadw.4 padw mem_loadw.0
     # => [tag, aux, note_type, execution_hint, RECIPIENT]
 
     call.tx::create_note
     # => [note_idx]
 
+    # Add ASSET_OUT (with equal to or better than rate)
+
     mem_loadw.ASSET_OUT
+    # => [ASSET_OUT]
 
     mem_load.DY_OUT
+    # => [dy, ASSET_OUT]
 
-    movdn.3
-    # => [ASSET_Y_OUT]
+    swap.4 drop
+    # => [ASSET_OUT]
 
     call.wallet::move_asset_to_note
     # => [ASSET, note_idx]

@@ -47,13 +47,13 @@ async fn amm_test() -> anyhow::Result<()> {
     // Initialize assets & accounts
     let asset_a: Asset = FungibleAsset::new(
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(),
-        1000,
+        10_000,
     )
     .unwrap()
     .into();
     let asset_b: Asset = FungibleAsset::new(
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap(),
-        1001,
+        10_001,
     )
     .unwrap()
     .into();
@@ -80,7 +80,7 @@ async fn amm_test() -> anyhow::Result<()> {
             .unwrap()
             .into();
     let asset_out: FungibleAsset =
-        FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap(), 100)
+        FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap(), 95)
             .unwrap()
             .into();
 

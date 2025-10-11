@@ -19,7 +19,7 @@ use miden_client::{
     keystore::FilesystemKeyStore,
     note::{
         Note, NoteAssets, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient,
-        NoteRelevance, NoteTag, NoteType,
+        NoteRelevance, NoteTag, NoteType, build_p2id_recipient,
     },
     store::{InputNoteRecord, TransactionFilter},
     transaction::{
@@ -232,6 +232,7 @@ pub async fn create_testing_amm_account(pool_x: Asset, pool_y: Asset) -> Result<
         .with_auth_component(auth::NoAuth)
         .with_component(swap_component.clone())
         .with_component(lp_component)
+        .with_component(BasicWallet)
         .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap())
         .with_assets(vec![pool_x, pool_y])
         .build_existing()
@@ -240,6 +241,29 @@ pub async fn create_testing_amm_account(pool_x: Asset, pool_y: Asset) -> Result<
     //counter_contract
 
     Ok(counter_contract)
+}
+
+pub fn create_exact_p2id_note(
+    sender: AccountId,
+    target: AccountId,
+    assets: Vec<Asset>,
+    serial_num: Word,
+) -> Result<Note, Error> {
+    let recipient = build_p2id_recipient(target, serial_num).unwrap();
+
+    let tag = NoteTag::from_account_id(target);
+
+    let metadata = NoteMetadata::new(
+        sender,
+        NoteType::Private,
+        tag,
+        NoteExecutionHint::always(),
+        Felt::new(0),
+    )
+    .unwrap();
+    let vault = NoteAssets::new(assets).unwrap();
+
+    Ok(Note::new(vault, metadata, recipient))
 }
 
 pub async fn create_amm_input_note(
@@ -254,7 +278,7 @@ pub async fn create_amm_input_note(
     let library_path = "external_contract::amm_contract";
     let library = create_library(account_code, library_path).unwrap();
 
-    let serial_num = Word::default();
+    let swap_note_in_serial_num = Word::default();
 
     let note_script = ScriptBuilder::new(true)
         .with_dynamically_linked_library(&library)
@@ -262,8 +286,24 @@ pub async fn create_amm_input_note(
         .compile_note_script(note_code)
         .unwrap();
 
+    let p2id_output = create_exact_p2id_note(
+        amm_account,
+        creator_account.id(),
+        vec![],
+        swap_note_in_serial_num,
+    )
+    .unwrap();
+
     let note_inputs = NoteInputs::new(
         [
+            Felt::new(p2id_output.metadata().execution_hint().into()),
+            Felt::try_from(p2id_output.metadata().note_type()).unwrap(),
+            Felt::try_from(p2id_output.metadata().aux()).unwrap(),
+            Felt::new(p2id_output.metadata().tag().as_u32().into()),
+            p2id_output.recipient().digest()[3],
+            p2id_output.recipient().digest()[2],
+            p2id_output.recipient().digest()[1],
+            p2id_output.recipient().digest()[0],
             Felt::new(asset_out.amount()),
             Felt::new(0),
             asset_out.faucet_id().suffix().into(),
@@ -272,7 +312,7 @@ pub async fn create_amm_input_note(
         .to_vec(),
     )
     .unwrap();
-    let recipient = NoteRecipient::new(serial_num, note_script, note_inputs.clone());
+    let recipient = NoteRecipient::new(swap_note_in_serial_num, note_script, note_inputs.clone());
 
     let tag = NoteTag::from_account_id(amm_account);
     let metadata = NoteMetadata::new(
