@@ -28,9 +28,9 @@ const.ASSET_OUT=212
 
 # ERRORS
 const.OVERFLOW="value larger than 32 bits"
-
 const.ERR_SLIPPAGE="slippage higher than user set accepted range"
 
+# Storage slots
 const.BALANCES_SLOT=0
 
 # AMM CALCULATION

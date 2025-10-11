@@ -226,7 +226,7 @@ pub async fn create_testing_amm_account(pool_x: Asset, pool_y: Asset) -> Result<
     let decimals = 8u8;
     let max_supply = Felt::new(1_000_000u64);
 
-    let counter_contract = AccountBuilder::new([3u8; 32])
+    let amm_contract = AccountBuilder::new([3u8; 32])
         .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
         .with_auth_component(auth::NoAuth)
@@ -238,9 +238,56 @@ pub async fn create_testing_amm_account(pool_x: Asset, pool_y: Asset) -> Result<
         .build_existing()
         .unwrap();
 
-    //counter_contract
+    Ok(amm_contract)
+}
 
-    Ok(counter_contract)
+pub async fn create_testnet_amm_account() -> Result<(Account, Word), Error> {
+    let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
+
+    // Load the MASM file for the counter contract
+    let amm_path = Path::new("masm/accounts/amm.masm");
+    let amm_code = fs::read_to_string(amm_path).unwrap();
+
+    // Load the MASM file for the counter contract
+    let deposit_withdraw_path = Path::new("masm/accounts/liquidity.masm");
+    let deposit_withdraw_code = fs::read_to_string(deposit_withdraw_path).unwrap();
+
+    let swap_component = AccountComponent::compile(
+        amm_code.to_string(),
+        assembler.clone(),
+        vec![StorageSlot::Value(
+            [Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)].into(),
+        )],
+    )
+    .unwrap()
+    .with_supports_all_types();
+
+    let lp_component = AccountComponent::compile(
+        deposit_withdraw_code.to_string(),
+        assembler.clone(),
+        vec![StorageSlot::Value(
+            [Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)].into(),
+        )],
+    )
+    .unwrap()
+    .with_supports_all_types();
+
+    let symbol: TokenSymbol = TokenSymbol::new("LP").unwrap();
+    let decimals = 8u8;
+    let max_supply = Felt::new(1_000_000u64);
+
+    let (amm_contract, amm_seed) = AccountBuilder::new([3u8; 32])
+        .account_type(AccountType::FungibleFaucet)
+        .storage_mode(AccountStorageMode::Network)
+        .with_auth_component(auth::NoAuth)
+        .with_component(swap_component.clone())
+        .with_component(lp_component)
+        .with_component(BasicWallet)
+        .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap())
+        .build()
+        .unwrap();
+
+    Ok((amm_contract, amm_seed))
 }
 
 pub fn create_exact_p2id_note(
@@ -267,7 +314,7 @@ pub fn create_exact_p2id_note(
 }
 
 pub async fn create_amm_input_note(
-    creator_account: Account,
+    creator_account: AccountId,
     amm_account: AccountId,
     asset_in: FungibleAsset,
     asset_out: FungibleAsset,
@@ -288,7 +335,7 @@ pub async fn create_amm_input_note(
 
     let p2id_output = create_exact_p2id_note(
         amm_account,
-        creator_account.id(),
+        creator_account,
         vec![],
         swap_note_in_serial_num,
     )
@@ -316,10 +363,10 @@ pub async fn create_amm_input_note(
 
     let tag = NoteTag::from_account_id(amm_account);
     let metadata = NoteMetadata::new(
-        creator_account.id(),
+        creator_account,
         NoteType::Public,
         tag,
-        NoteExecutionHint::none(),
+        NoteExecutionHint::always(),
         Felt::new(0),
     )
     .unwrap();

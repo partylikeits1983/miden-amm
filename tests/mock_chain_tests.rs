@@ -84,10 +84,14 @@ async fn amm_test() -> anyhow::Result<()> {
             .unwrap()
             .into();
 
-    let amm_input_note =
-        create_amm_input_note(alice_account.clone(), amm_account.id(), asset_in, asset_out)
-            .await
-            .unwrap();
+    let amm_input_note = create_amm_input_note(
+        alice_account.clone().id(),
+        amm_account.id(),
+        asset_in,
+        asset_out,
+    )
+    .await
+    .unwrap();
 
     // Add the note to the builder
     builder.add_note(OutputNote::Full(amm_input_note.clone()));

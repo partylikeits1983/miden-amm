@@ -1,6 +1,6 @@
 use miden_amm::common::{
-    create_basic_account, create_basic_faucet, create_library_with_assembler, wait_for_note,
-    wait_for_tx,
+    create_amm_input_note, create_basic_account, create_basic_faucet,
+    create_library_with_assembler, create_testnet_amm_account, wait_for_note, wait_for_tx,
 };
 use rand::RngCore;
 use std::{fs, path::Path, sync::Arc};
@@ -8,10 +8,7 @@ use tokio::time::{Duration, sleep};
 
 use miden_client::{
     Felt, Word,
-    account::{
-        AccountBuilder, AccountIdAddress, AccountStorageMode, AccountType, Address,
-        AddressInterface, StorageMap, StorageSlot, component::BasicWallet,
-    },
+    account::{AccountIdAddress, Address, AddressInterface, StorageMap, StorageSlot},
     asset::FungibleAsset,
     builder::ClientBuilder,
     crypto::FeltRng,
@@ -23,7 +20,6 @@ use miden_client::{
     rpc::{Endpoint, TonicRpcClient},
     transaction::{OutputNote, TransactionKernel, TransactionRequestBuilder},
 };
-use miden_lib::account::auth::NoAuth;
 use miden_lib::utils::ScriptBuilder;
 use miden_objects::{
     account::{AccountComponent, NetworkId},
@@ -31,7 +27,7 @@ use miden_objects::{
 };
 
 #[tokio::test]
-async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_amm_swap_ntx() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize client & keystore
     let endpoint = Endpoint::testnet();
     let timeout_ms = 10_000;
@@ -50,7 +46,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     println!("Latest block: {}", sync_summary.block_num);
 
     // -------------------------------------------------------------------------
-    // STEP 1: Create accounts and deploy faucet
+    // STEP 1: Create accounts and deploy faucets
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Creating new accounts");
     let alice_account = create_basic_account(&mut client, (*keystore).clone()).await?;
@@ -64,12 +60,22 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
         .to_bech32(NetworkId::Testnet)
     );
 
-    println!("\nDeploying a new fungible faucet.");
-    let faucet = create_basic_faucet(&mut client, (*keystore).clone()).await?;
+    let faucet_a = create_basic_faucet(&mut client, (*keystore).clone()).await?;
     println!(
-        "Faucet account ID: {:?}",
+        "Faucet A account ID: {:?}",
         Address::from(AccountIdAddress::new(
-            faucet.id(),
+            faucet_a.id(),
+            AddressInterface::Unspecified
+        ))
+        .to_bech32(NetworkId::Testnet)
+    );
+    client.sync_state().await?;
+
+    let faucet_b = create_basic_faucet(&mut client, (*keystore).clone()).await?;
+    println!(
+        "Faucet A account ID: {:?}",
+        Address::from(AccountIdAddress::new(
+            faucet_b.id(),
             AddressInterface::Unspecified
         ))
         .to_bech32(NetworkId::Testnet)
@@ -77,9 +83,9 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     client.sync_state().await?;
 
     // -------------------------------------------------------------------------
-    // STEP 2: Create deposit_withdraw contract (NETWORK ACCOUNT)
+    // STEP 2: Create AMM contract (NETWORK ACCOUNT)
     // -------------------------------------------------------------------------
-    println!("\n[STEP 2] Creating deposit_withdraw network contract.");
+    println!("\n[STEP 2] Creating AMM network contract.");
 
     // Prepare assembler (debug mode = true)
     let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
@@ -92,7 +98,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let storage_slot_map = StorageSlot::Map(storage_map.clone());
 
     // Compile the account code into `AccountComponent` with one storage slot for balance
-    let contract_component =
+    let _contract_component =
         AccountComponent::compile(contract_code.clone(), assembler, vec![storage_slot_map])
             .unwrap()
             .with_supports_all_types();
@@ -102,31 +108,16 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     client.rng().fill_bytes(&mut seed);
 
     // Build the new `Account` with the component - NETWORK ACCOUNT
-    let (deposit_contract, contract_seed) = AccountBuilder::new(seed)
-        .account_type(AccountType::RegularAccountImmutableCode)
-        .storage_mode(AccountStorageMode::Network) // NETWORK STORAGE
-        .with_component(BasicWallet)
-        .with_component(contract_component.clone())
-        .with_auth_component(NoAuth) // NO AUTH FOR NETWORK ACCOUNTS
-        .build()
-        .unwrap();
+    let (amm_contract, amm_seed) = create_testnet_amm_account().await.unwrap();
 
     println!(
         "deposit_contract commitment: {:?}",
-        deposit_contract.commitment()
+        amm_contract.commitment()
     );
-    println!(
-        "deposit_contract id: {:?}",
-        Address::from(AccountIdAddress::new(
-            faucet.id(),
-            AddressInterface::Unspecified
-        ))
-        .to_bech32(NetworkId::Testnet)
-    );
-    println!("deposit_contract storage: {:?}", deposit_contract.storage());
+    println!("deposit_contract storage: {:?}", amm_contract.storage());
 
     client
-        .add_account(&deposit_contract.clone(), Some(contract_seed), false)
+        .add_account(&amm_contract.clone(), Some(amm_seed), false)
         .await
         .unwrap();
 
@@ -160,7 +151,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
         .unwrap();
 
     let tx_result = client
-        .new_transaction(deposit_contract.id(), tx_deploy_request)
+        .new_transaction(amm_contract.id(), tx_deploy_request)
         .await
         .unwrap();
 
@@ -179,8 +170,8 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     // STEP 4: Mint tokens for Alice
     // -------------------------------------------------------------------------
     println!("\n[STEP 4] Mint tokens for Alice");
-    let faucet_id = faucet.id();
-    let amount: u64 = 100;
+    let faucet_id = faucet_a.id();
+    let amount: u64 = 1000;
     let mint_amount = FungibleAsset::new(faucet_id, amount).unwrap();
     let tx_request = TransactionRequestBuilder::new()
         .build_mint_fungible_asset(
@@ -190,7 +181,41 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
             client.rng(),
         )
         .unwrap();
-    let tx_exec = client.new_transaction(faucet.id(), tx_request).await?;
+    let tx_exec = client.new_transaction(faucet_a.id(), tx_request).await?;
+    client.submit_transaction(tx_exec.clone()).await?;
+
+    let p2id_note = if let OutputNote::Full(note) = tx_exec.created_notes().get_note(0) {
+        note.clone()
+    } else {
+        panic!("Expected OutputNote::Full");
+    };
+
+    // Wait for the P2ID note to be available
+    wait_for_note(&mut client, &alice_account.clone(), &p2id_note).await?;
+
+    let consume_request = TransactionRequestBuilder::new()
+        .authenticated_input_notes([(p2id_note.id(), None)])
+        .build()
+        .unwrap();
+    let tx_exec = client
+        .new_transaction(alice_account_id, consume_request)
+        .await?;
+    client.submit_transaction(tx_exec).await?;
+    client.sync_state().await?;
+
+    // ASSET B
+    let faucet_id = faucet_b.id();
+    let amount: u64 = 1000;
+    let mint_amount = FungibleAsset::new(faucet_id, amount).unwrap();
+    let tx_request = TransactionRequestBuilder::new()
+        .build_mint_fungible_asset(
+            mint_amount,
+            alice_account_id,
+            NoteType::Public,
+            client.rng(),
+        )
+        .unwrap();
+    let tx_exec = client.new_transaction(faucet_a.id(), tx_request).await?;
     client.submit_transaction(tx_exec.clone()).await?;
 
     let p2id_note = if let OutputNote::Full(note) = tx_exec.created_notes().get_note(0) {
@@ -213,47 +238,24 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     client.sync_state().await?;
 
     // -------------------------------------------------------------------------
-    // STEP 5: Create deposit note with assets (TAGGED FOR NETWORK CONTRACT)
+    // STEP 5: Create AMM SWAP note with assets (TAGGED FOR NETWORK CONTRACT)
     // -------------------------------------------------------------------------
     println!("\n[STEP 5] Create deposit note with assets");
 
-    let assembler = TransactionKernel::assembler().with_debug_mode(true);
-
-    // Create library from the deposit contract code so the note can call its procedures
-    let contract_lib = create_library_with_assembler(
-        assembler.clone(),
-        "external_contract::deposit_withdraw_contract",
-        &contract_code,
-    )
-    .unwrap();
-
-    let note_code = fs::read_to_string(Path::new("masm/notes/deposit_withdraw_note.masm")).unwrap();
-    let serial_num = client.rng().draw_word();
-
-    let note_script = ScriptBuilder::new(true)
-        .with_dynamically_linked_library(&contract_lib)
+    let asset_in: FungibleAsset = FungibleAsset::new(faucet_a.id().try_into().unwrap(), 100)
         .unwrap()
-        .compile_note_script(note_code)
-        .unwrap();
-    let note_inputs = NoteInputs::new(vec![]).unwrap(); // No special inputs needed
-    let recipient = NoteRecipient::new(serial_num, note_script, note_inputs);
+        .into();
+    let asset_out: FungibleAsset = FungibleAsset::new(faucet_b.id().try_into().unwrap(), 95)
+        .unwrap()
+        .into();
 
-    // TAG THE NOTE WITH THE DEPOSIT CONTRACT ID FOR NETWORK ROUTING
-    let tag = NoteTag::from_account_id(deposit_contract.id());
-
-    let metadata = NoteMetadata::new(
-        alice_account_id,
-        NoteType::Public,
-        tag,
-        NoteExecutionHint::always(),
-        Felt::new(0),
-    )?;
-    let vault = NoteAssets::new(vec![mint_amount.into()])?;
-    let deposit_note = Note::new(vault, metadata, recipient);
-    println!("deposit network note id: {:?}", deposit_note.id().to_hex());
+    let amm_swap_note =
+        create_amm_input_note(alice_account.id(), amm_contract.id(), asset_in, asset_out)
+            .await
+            .unwrap();
 
     let note_request = TransactionRequestBuilder::new()
-        .own_output_notes(vec![OutputNote::Full(deposit_note.clone())])
+        .own_output_notes(vec![OutputNote::Full(amm_swap_note.clone())])
         .build()
         .unwrap();
     let tx_result = client
@@ -270,7 +272,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     wait_for_note(
         &mut client,
         &alice_account, // No specific account filter for network notes
-        &deposit_note,
+        &amm_swap_note,
     )
     .await?;
 
@@ -285,7 +287,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     println!("\n[STEP 6] Checking contract state after network deposit");
 
     // Retrieve updated contract data to see the balance
-    let account = client.get_account(deposit_contract.id()).await.unwrap();
+    let account = client.get_account(amm_contract.id()).await.unwrap();
     if let Some(account_data) = account {
         println!("📊 Contract balance updated by network");
         println!(
@@ -301,7 +303,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
 
     // Create a P2ID note with the same asset amount, targeted to Alice
     let withdraw_p2id_note = create_p2id_note(
-        deposit_contract.id(),    // sender (the contract)
+        amm_contract.id(),        // sender (the contract)
         alice_account_id,         // target (Alice)
         vec![mint_amount.into()], // same asset that was deposited
         NoteType::Private,
@@ -357,7 +359,7 @@ async fn test_deploy_deposit_withdraw_ntx() -> Result<(), Box<dyn std::error::Er
     let withdrawal_note_recipient = NoteRecipient::new(serial_num, note_script, note_inputs);
 
     // TAG THE WITHDRAWAL NOTE WITH THE DEPOSIT CONTRACT ID FOR NETWORK ROUTING
-    let tag = NoteTag::from_account_id(deposit_contract.id());
+    let tag = NoteTag::from_account_id(amm_contract.id());
 
     let metadata = NoteMetadata::new(
         alice_account_id,
