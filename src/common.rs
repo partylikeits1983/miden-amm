@@ -4,7 +4,7 @@ use miden_assembly::{
 };
 use miden_lib::account::auth;
 use rand::{RngCore, rngs::StdRng};
-use std::sync::Arc;
+use std::{fs, path::Path, sync::Arc};
 use tokio::time::{Duration, sleep};
 
 use miden_client::{
@@ -13,7 +13,7 @@ use miden_client::{
         Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageSlot,
         component::{AuthRpoFalcon512, BasicFungibleFaucet, BasicWallet},
     },
-    asset::{FungibleAsset, TokenSymbol},
+    asset::{Asset, FungibleAsset, TokenSymbol},
     auth::AuthSecretKey,
     crypto::SecretKey,
     keystore::FilesystemKeyStore,
@@ -191,11 +191,19 @@ pub async fn wait_for_notes(
     Ok(())
 }
 
-pub async fn create_amm_account(account_code: &str) -> Result<(Account, Word), Error> {
+pub async fn create_testing_amm_account(pool_x: Asset, pool_y: Asset) -> Result<Account, Error> {
     let assembler: Assembler = TransactionKernel::assembler().with_debug_mode(true);
 
-    let counter_component = AccountComponent::compile(
-        account_code.to_string(),
+    // Load the MASM file for the counter contract
+    let amm_path = Path::new("masm/accounts/amm.masm");
+    let amm_code = fs::read_to_string(amm_path).unwrap();
+
+    // Load the MASM file for the counter contract
+    let deposit_withdraw_path = Path::new("masm/accounts/liquidity.masm");
+    let deposit_withdraw_code = fs::read_to_string(deposit_withdraw_path).unwrap();
+
+    let swap_component = AccountComponent::compile(
+        amm_code.to_string(),
         assembler.clone(),
         vec![StorageSlot::Value(
             [Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)].into(),
@@ -204,35 +212,69 @@ pub async fn create_amm_account(account_code: &str) -> Result<(Account, Word), E
     .unwrap()
     .with_supports_all_types();
 
-    let (counter_contract, counter_seed) = AccountBuilder::new([3u8; 32])
-        .account_type(AccountType::RegularAccountImmutableCode)
+    let lp_component = AccountComponent::compile(
+        deposit_withdraw_code.to_string(),
+        assembler.clone(),
+        vec![StorageSlot::Value(
+            [Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)].into(),
+        )],
+    )
+    .unwrap()
+    .with_supports_all_types();
+
+    let symbol: TokenSymbol = TokenSymbol::new("LP").unwrap();
+    let decimals = 8u8;
+    let max_supply = Felt::new(1_000_000u64);
+
+    let counter_contract = AccountBuilder::new([3u8; 32])
+        .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
         .with_auth_component(auth::NoAuth)
-        .with_component(counter_component.clone())
-        .build()
+        .with_component(swap_component.clone())
+        .with_component(lp_component)
+        .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap())
+        .with_assets(vec![pool_x, pool_y])
+        .build_existing()
         .unwrap();
 
-    Ok((counter_contract, counter_seed))
+    //counter_contract
+
+    Ok(counter_contract)
 }
 
 pub async fn create_amm_input_note(
-    note_code: String,
-    account_library: Library,
     creator_account: Account,
-    counter_contract_id: AccountId,
+    amm_account: AccountId,
+    asset_in: FungibleAsset,
+    asset_out: FungibleAsset,
 ) -> Result<Note, Error> {
+    let note_code = fs::read_to_string(Path::new("masm/notes/amm_input_note.masm")).unwrap();
+    let account_code = fs::read_to_string(Path::new("masm/accounts/amm.masm")).unwrap();
+
+    let library_path = "external_contract::amm_contract";
+    let library = create_library(account_code, library_path).unwrap();
+
     let serial_num = Word::default();
 
     let note_script = ScriptBuilder::new(true)
-        .with_dynamically_linked_library(&account_library)
+        .with_dynamically_linked_library(&library)
         .unwrap()
         .compile_note_script(note_code)
         .unwrap();
 
-    let note_inputs = NoteInputs::new([].to_vec()).unwrap();
+    let note_inputs = NoteInputs::new(
+        [
+            Felt::new(asset_out.amount()),
+            Felt::new(0),
+            asset_out.faucet_id().suffix().into(),
+            asset_out.faucet_id().prefix().into(),
+        ]
+        .to_vec(),
+    )
+    .unwrap();
     let recipient = NoteRecipient::new(serial_num, note_script, note_inputs.clone());
 
-    let tag = NoteTag::from_account_id(counter_contract_id);
+    let tag = NoteTag::from_account_id(amm_account);
     let metadata = NoteMetadata::new(
         creator_account.id(),
         NoteType::Public,
@@ -242,7 +284,8 @@ pub async fn create_amm_input_note(
     )
     .unwrap();
 
-    let note = Note::new(NoteAssets::default(), metadata, recipient);
+    let note_asset = NoteAssets::new(vec![asset_in.into()]).unwrap();
+    let note = Note::new(note_asset, metadata, recipient);
 
     Ok(note)
 }

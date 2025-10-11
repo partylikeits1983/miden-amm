@@ -1,0 +1,67 @@
+use.miden::account
+use.miden::contracts::wallets::basic->wallet
+use.miden::note
+use.miden::tx
+use.std::math::u64
+use.std::sys
+
+const.BALANCES_SLOT=0
+
+# Deposit assets into the contract
+# Expects the asset to be on the stack: [ASSET]
+# => []
+export.deposit
+    # => [ASSET]
+
+    dupw
+    # => [ASSET, ASSET]
+
+    # Store the asset in the account's vault
+    call.wallet::receive_asset
+    # => [ASSET]
+
+    exec.note::get_sender
+    # => [sender, ASSET]
+
+    push.0 movdn.2 push.0 movdn.2
+    # => [SENDER, ASSET]
+
+    push.BALANCES_SLOT
+    # => [slot, SENDER, ASSET]
+
+    exec.account::set_map_item
+    # => [OLD_MAP_ROOT, OLD_MAP_VALUE]
+
+    dropw dropw
+
+    exec.sys::truncate_stack
+    # => []
+end
+
+# => [tag, aux, note_type, execution_hint, RECIPIENT]
+export.withdraw
+    # => [tag, aux, note_type, execution_hint, RECIPIENT]
+
+    call.tx::create_note
+    # => [note_idx]
+
+    exec.note::get_sender
+    # => [sender, note_idx]
+
+    push.0 movdn.2 push.0 movdn.2
+    # => [SENDER]
+
+    push.BALANCES_SLOT
+    # => [slot, SENDER, note_idx]
+
+    exec.account::get_map_item
+    # => [ASSET, note_idx]
+
+    call.wallet::move_asset_to_note
+    # => [ASSET, note_idx]
+
+    dropw drop
+
+    exec.sys::truncate_stack
+    # => []
+end

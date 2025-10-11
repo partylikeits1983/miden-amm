@@ -23,9 +23,8 @@ const.DX_MUL_Y_BASE = 100
 const.DX_PLUS_Y = 104
 
 # Memory Addresses
-const.DX_ASSET=200
-
-const.DY_OUT_ASSET=212
+const.ASSET_IN=200
+const.ASSET_OUT=212
 
 # ERRORS
 const.OVERFLOW="value larger than 32 bits"
@@ -124,37 +123,42 @@ export.deploy_contract
     # => []
 end
 
-# => [DX_ASSET, faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
+# => [ASSET_IN, ASSET_OUT]
 export.swap
-
-    mem_storew.DX_ASSET
+    mem_storew.ASSET_IN
 
     movup.2 drop movup.2 drop
-    # => [faucet_x_prefix, faucet_x_suffix]
+    # => [asset_in_prefix, asset_in_suffix, ASSET_OUT]
 
     ### ____ AMM COMPUTATION ____
 
     # get balance faucet_id_in
     call.account::get_balance
-    # => [token_x_balance, faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
+    # => [pool_x_balance, ASSET_OUT]
 
+    push.333 debug.stack drop
+    
     mem_store.POOL_X
-    # => [faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
+    # => [asset_in_prefix, asset_in_suffix, ASSET_OUT]
 
     push.0 movdn.2 push.0 movdn.2
 
-    mem_storew.DY_OUT_ASSET
-    # => [faucet_y_prefix, faucet_y_suffix, OUPUT_NOTE]
+    mem_storew.ASSET_OUT
+    # => [asset_out_prefix, asset_out_suffix, OUPUT_NOTE]
+
+    push.444 debug.stack drop swap
 
     # get balance faucet_id_out
     call.account::get_balance
-    # => [token_y_balance]
+    # => [asset_out_balance]
+
+    push.555 debug.stack drop
 
     mem_store.POOL_Y
     # => [OUPUT_NOTE]
 
-    mem_loadw.DX_ASSET
-    # => [DX_ASSET, OUPUT_NOTE]
+    mem_loadw.ASSET_IN
+    # => [ASSET_IN, OUPUT_NOTE]
 
     drop drop drop
     # => [dx, OUPUT_NOTE]
@@ -171,7 +175,7 @@ export.swap
     mem_store.DY_OUT
     # => []
 
-    mem_loadw.DX_ASSET
+    mem_loadw.ASSET_IN
 
     call.wallet::receive_asset
     # => []
@@ -184,7 +188,7 @@ export.swap
     call.tx::create_note
     # => [note_idx]
 
-    mem_loadw.DY_OUT_ASSET
+    mem_loadw.ASSET_OUT
 
     mem_load.DY_OUT
 
@@ -195,63 +199,4 @@ export.swap
     # => [ASSET, note_idx]
 
     dropw dropw
-end
-
-# Deposit assets into the contract
-# Expects the asset to be on the stack: [ASSET]
-# => []
-export.deposit
-    # => [ASSET]
-
-    dupw
-    # => [ASSET, ASSET]
-
-    # Store the asset in the account's vault
-    call.wallet::receive_asset
-    # => [ASSET]
-
-    exec.note::get_sender
-    # => [sender, ASSET]
-
-    push.0 movdn.2 push.0 movdn.2
-    # => [SENDER, ASSET]
-
-    push.BALANCES_SLOT
-    # => [slot, SENDER, ASSET]
-
-    exec.account::set_map_item
-    # => [OLD_MAP_ROOT, OLD_MAP_VALUE]
-
-    dropw dropw
-
-    exec.sys::truncate_stack
-    # => []
-end
-
-# => [tag, aux, note_type, execution_hint, RECIPIENT]
-export.withdraw
-    # => [tag, aux, note_type, execution_hint, RECIPIENT]
-
-    call.tx::create_note
-    # => [note_idx]
-
-    exec.note::get_sender
-    # => [sender, note_idx]
-
-    push.0 movdn.2 push.0 movdn.2
-    # => [SENDER]
-
-    push.BALANCES_SLOT
-    # => [slot, SENDER, note_idx]
-
-    exec.account::get_map_item
-    # => [ASSET, note_idx]
-
-    call.wallet::move_asset_to_note
-    # => [ASSET, note_idx]
-
-    dropw drop
-
-    exec.sys::truncate_stack
-    # => []
 end
