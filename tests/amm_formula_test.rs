@@ -1,195 +1,110 @@
-#[cfg(test)]
-mod amm_formula_tests {
-    const BASE: u64 = 100000; // 1e5 as defined in the MASM code
+//! Pure-Rust tests of the reference math in `common.rs`. These mirror the MASM formulas
+//! exactly, so they double as a specification for `amm.masm` / `liquidity.masm`.
 
-    /// Calculates the amount of asset Y to return given input of asset X
-    /// Formula: dy = (dx * y * BASE) / (dx + y)
-    ///
-    /// Args:
-    /// - x: Pool X amount (not used in calculation but represents pool state)
-    /// - y: Pool Y amount
-    /// - dx: Amount of X being input
-    ///
-    /// Returns: Amount of Y to output
-    fn get_amount_y_out(_x: u64, y: u64, dx: u64) -> u64 {
-        // Prevent division by zero
-        if dx + y == 0 {
-            return 0;
-        }
+use miden_amm::common::{
+    FEE_DENOM, MIN_LIQUIDITY, quote_initial_lp, quote_lp_mint, quote_remove_liquidity,
+    quote_swap_output,
+};
 
-        // Calculate: (dx * y * BASE) / (dx + y)
-        let numerator = dx
-            .checked_mul(y)
-            .and_then(|result| result.checked_mul(BASE))
-            .expect("Numerator overflow");
+#[test]
+fn zero_fee_reduces_to_constant_product() {
+    // dy = dx*y/(x+dx) when fee = 0
+    let (dx, x, y) = (1_000u64, 100_000u64, 400_000u64);
+    let expected = ((dx as u128) * (y as u128) / ((x + dx) as u128)) as u64;
+    assert_eq!(quote_swap_output(dx, x, y, 0), expected);
+}
 
-        let denominator = dx.checked_add(y).expect("Denominator overflow");
+#[test]
+fn fee_reduces_output() {
+    let (dx, x, y) = (30_000u64, 150_000u64, 600_000u64);
+    let no_fee = quote_swap_output(dx, x, y, 0);
+    let with_fee = quote_swap_output(dx, x, y, 30);
+    assert!(with_fee < no_fee);
+    // 0.3% fee should cost roughly 0.3% of output
+    let diff = no_fee - with_fee;
+    assert!(diff <= no_fee * 4 / 1000, "fee took too much: {diff} of {no_fee}");
+}
 
-        numerator / denominator
-    }
+#[test]
+fn swap_preserves_constant_product_invariant() {
+    // With a fee, k = x*y must strictly grow after a swap.
+    let (mut x, mut y) = (150_000u64, 600_000u64);
+    let k_before = (x as u128) * (y as u128);
+    let dx = 30_000u64;
+    let dy = quote_swap_output(dx, x, y, 30);
+    x += dx;
+    y -= dy;
+    let k_after = (x as u128) * (y as u128);
+    assert!(k_after > k_before, "constant product must not decrease");
+}
 
-    /// Alternative implementation that matches the MASM code more closely
-    /// This version divides by BASE at the end, effectively calculating:
-    /// dy = (dx * y) / (dx + y)
-    fn get_amount_y_out_alternative(_x: u64, y: u64, dx: u64) -> u64 {
-        // Prevent division by zero
-        if dx + y == 0 {
-            return 0;
-        }
+#[test]
+fn max_fee_gives_zero_output() {
+    assert_eq!(quote_swap_output(1_000, 100_000, 400_000, FEE_DENOM), 0);
+}
 
-        // Calculate: (dx * y * BASE) / (dx + y) / BASE = (dx * y) / (dx + y)
-        let numerator = dx
-            .checked_mul(y)
-            .and_then(|result| result.checked_mul(BASE))
-            .expect("Numerator overflow");
+#[test]
+fn initial_lp_is_sqrt_minus_minimum() {
+    // sqrt(100_000 * 400_000) = sqrt(4e10) = 200_000
+    let (minted, supply) = quote_initial_lp(100_000, 400_000);
+    assert_eq!(supply, 200_000);
+    assert_eq!(minted, 200_000 - MIN_LIQUIDITY);
+}
 
-        let denominator = dx.checked_add(y).expect("Denominator overflow");
+#[test]
+#[should_panic(expected = "initial deposit too small")]
+fn tiny_initial_deposit_panics() {
+    // sqrt(100*100) = 100 <= MIN_LIQUIDITY
+    quote_initial_lp(100, 100);
+}
 
-        let result = numerator / denominator;
-        result / BASE
-    }
+#[test]
+fn proportional_deposit_mints_proportional_lp() {
+    // Depositing 50% of reserves mints 50% of supply.
+    let (x, y, s) = (100_000u64, 400_000u64, 200_000u64);
+    let lp = quote_lp_mint(50_000, 200_000, x, y, s);
+    assert_eq!(lp, s / 2);
+}
 
-    #[test]
-    fn test_amm_formula_basic() {
-        // Test case 1: Basic calculation
-        let x = 1000; // Pool X (not used in formula but represents state)
-        let y = 1000; // Pool Y
-        let dx = 100; // Input amount X
+#[test]
+fn unbalanced_deposit_mints_minimum_side() {
+    // The overpaid side is donated to the pool (Uniswap v2 semantics).
+    let (x, y, s) = (100_000u64, 400_000u64, 200_000u64);
+    let balanced = quote_lp_mint(50_000, 200_000, x, y, s);
+    let unbalanced = quote_lp_mint(50_000, 300_000, x, y, s);
+    assert_eq!(balanced, unbalanced);
+}
 
-        let dy = get_amount_y_out(x, y, dx);
+#[test]
+fn remove_liquidity_round_trip() {
+    let (x, y, s) = (150_000u64, 600_000u64, 300_000u64);
+    let (ax, ay) = quote_remove_liquidity(100_000, x, y, s);
+    assert_eq!(ax, 50_000);
+    assert_eq!(ay, 200_000);
+    // burning the whole supply drains the pool
+    let (ax, ay) = quote_remove_liquidity(s, x, y, s);
+    assert_eq!((ax, ay), (x, y));
+}
 
-        // Expected: (100 * 2000 * 100000) / (100 + 2000) = 20000000000 / 2100 = 9523809
-        let expected = (dx * y * BASE) / (dx + y);
-        assert_eq!(dy, expected);
-        // assert_eq!(dy, 9523809);
+#[test]
+fn lps_earn_swap_fees() {
+    // A passive LP's redeemable value (in both assets) grows after fee-charging swaps.
+    let (mut x, mut y) = (100_000u64, 400_000u64);
+    let supply = 200_000u64;
+    let lp_position = 50_000u64;
 
-        println!("Test 1 - Basic calculation:");
-        println!("  Pool X: {}, Pool Y: {}, Input dX: {}", x, y, dx);
-        println!("  Output dY: {}", dy);
-    }
+    let (ax0, ay0) = quote_remove_liquidity(lp_position, x, y, supply);
 
-    #[test]
-    fn test_amm_formula_alternative() {
-        // Test the alternative implementation (matching MASM double division)
-        let x = 1000;
-        let y = 2000;
-        let dx = 100;
+    // run a round-trip swap (X->Y then Y->X) with a 0.3% fee
+    let dy = quote_swap_output(10_000, x, y, 30);
+    x += 10_000;
+    y -= dy;
+    let dx_back = quote_swap_output(dy, y, x, 30);
+    y += dy;
+    x -= dx_back;
 
-        let dy = get_amount_y_out_alternative(x, y, dx);
-
-        // Expected: (100 * 2000) / (100 + 2000) = 200000 / 2100 = 95
-        let expected = (dx * y) / (dx + y);
-        assert_eq!(dy, expected);
-        assert_eq!(dy, 95);
-
-        println!("Test 2 - Alternative calculation (with BASE cancellation):");
-        println!("  Pool X: {}, Pool Y: {}, Input dX: {}", x, y, dx);
-        println!("  Output dY: {}", dy);
-    }
-
-    #[test]
-    fn test_amm_formula_edge_cases() {
-        // Test case: Small values
-        let dy1 = get_amount_y_out(100, 100, 10);
-        assert_eq!(dy1, (10 * 100 * BASE) / (10 + 100));
-
-        // Test case: Large pool, small input
-        let dy2 = get_amount_y_out(1000000, 1000000, 1);
-        assert_eq!(dy2, (1 * 1000000 * BASE) / (1 + 1000000));
-
-        // Test case: Equal pools
-        let dy3 = get_amount_y_out(500, 500, 50);
-        assert_eq!(dy3, (50 * 500 * BASE) / (50 + 500));
-
-        println!("Test 3 - Edge cases:");
-        println!("  Small values: {}", dy1);
-        println!("  Large pool, small input: {}", dy2);
-        println!("  Equal pools: {}", dy3);
-    }
-
-    #[test]
-    fn test_amm_formula_zero_input() {
-        // Test case: Zero input should return zero output
-        let dy = get_amount_y_out(1000, 1000, 0);
-        assert_eq!(dy, 0);
-
-        println!("Test 4 - Zero input: {}", dy);
-    }
-
-    #[test]
-    fn test_amm_formula_precision() {
-        // Test precision with the BASE multiplier
-        let x = 1000;
-        let y = 1000;
-        let dx = 1;
-
-        let dy = get_amount_y_out(x, y, dx);
-        let dy_alt = get_amount_y_out_alternative(x, y, dx);
-
-        // With BASE: (1 * 1000 * 100000) / (1 + 1000) = 100000000 / 1001 = 99900
-        // Without BASE: (1 * 1000) / (1 + 1000) = 1000 / 1001 = 0 (integer division)
-
-        assert_eq!(dy, 99900);
-        assert_eq!(dy_alt, 0); // Loses precision due to integer division
-
-        println!("Test 5 - Precision comparison:");
-        println!("  With BASE multiplier: {}", dy);
-        println!("  Without BASE multiplier: {}", dy_alt);
-        println!("  This shows BASE provides precision for small values");
-    }
-
-    #[test]
-    fn test_amm_formula_realistic_values() {
-        // Test with realistic but smaller token amounts to avoid overflow
-        let pool_x = 1_000_000; // 1M tokens (no decimals for simplicity)
-        let pool_y = 2_000_000; // 2M tokens
-        let input_dx = 10_000; // 10K tokens
-
-        let dy = get_amount_y_out(pool_x, pool_y, input_dx);
-
-        // Calculate expected result using checked arithmetic to avoid overflow
-        let numerator = input_dx
-            .checked_mul(pool_y)
-            .and_then(|result| result.checked_mul(BASE))
-            .expect("Expected calculation overflow");
-        let denominator = input_dx + pool_y;
-        let expected = numerator / denominator;
-
-        assert_eq!(dy, expected);
-
-        println!("Test 6 - Realistic values:");
-        println!("  Pool X: {} tokens", pool_x);
-        println!("  Pool Y: {} tokens", pool_y);
-        println!("  Input dX: {} tokens", input_dx);
-        println!("  Output dY: {} tokens", dy);
-        println!("  Expected: {}", expected);
-    }
-
-    #[test]
-    fn test_amm_formula_large_numbers() {
-        // Test with large numbers using more careful arithmetic
-        let pool_x = 100_000;
-        let pool_y = 200_000;
-        let input_dx = 1_000;
-
-        let dy = get_amount_y_out(pool_x, pool_y, input_dx);
-
-        // Calculate step by step to avoid overflow
-        let dx_mul_y = input_dx.checked_mul(pool_y).expect("dx * y overflow");
-        let numerator = dx_mul_y.checked_mul(BASE).expect("numerator overflow");
-        let denominator = input_dx.checked_add(pool_y).expect("denominator overflow");
-        let expected = numerator / denominator;
-
-        assert_eq!(dy, expected);
-
-        println!("Test 7 - Large numbers:");
-        println!(
-            "  Pool X: {}, Pool Y: {}, Input dX: {}",
-            pool_x, pool_y, input_dx
-        );
-        println!("  Output dY: {}", dy);
-        println!("  dx * y = {}", dx_mul_y);
-        println!("  numerator = {}", numerator);
-        println!("  denominator = {}", denominator);
-    }
+    let (ax1, ay1) = quote_remove_liquidity(lp_position, x, y, supply);
+    // y reserve is unchanged after the round trip, x reserve grew by the fees
+    assert!(ax1 > ax0);
+    assert!(ay1 >= ay0);
 }

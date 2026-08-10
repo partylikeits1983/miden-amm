@@ -1,67 +1,499 @@
-use.miden::account
-use.miden::contracts::wallets::basic->wallet
-use.miden::note
-use.miden::tx
-use.std::math::u64
-use.std::sys
+use miden::protocol::active_account
+use miden::protocol::native_account
+use miden::protocol::active_note
+use miden::protocol::output_note
+use miden::protocol::faucet
+use miden::protocol::asset
+use miden::core::math::u64
+use miden::core::math::u128
+use miden::core::sys
 
-const.BALANCES_SLOT=0
+# CONSTANTS
+# =================================================================================================
 
-# Deposit assets into the contract
-# Expects the asset to be on the stack: [ASSET]
-# => []
-export.deposit
-    # => [ASSET]
+# Uniswap-v2-style minimum liquidity, permanently locked in lp_supply on the first deposit.
+const MIN_LIQUIDITY = 1000
+const U32_SHIFT = 0x0000000100000000
 
-    dupw
-    # => [ASSET, ASSET]
+# Storage slots
+# lp_supply is contributed by this component; the pool key slots come from the amm component.
+const LP_SUPPLY_SLOT = word("miden_amm::amm::lp_supply")
+const POOL_X_KEY_SLOT = word("miden_amm::amm::pool_x_key")
+const POOL_Y_KEY_SLOT = word("miden_amm::amm::pool_y_key")
 
-    # Store the asset in the account's vault
-    call.wallet::receive_asset
-    # => [ASSET]
+# Memory layout (word-aligned)
+# Liquidity note storage: [RECIPIENT (4), tag, note_type, min_a, min_b]
+#   add_liquidity:    min_a = min_lp_out,  min_b = unused
+#   remove_liquidity: min_a = min_x_out,   min_b = min_y_out
+const NOTE_STORAGE_PTR = 0
+const RECIPIENT_PTR = 0
+const TAG_PTR = 4
+const NOTE_TYPE_PTR = 5
+const MIN_A_PTR = 6
+const MIN_B_PTR = 7
+# Note assets: each asset is ASSET_KEY at +0, ASSET_VALUE at +4 (8 felts per asset)
+const ASSETS_PTR = 16
+const KEY_A_PTR = 16
+const VALUE_A_PTR = 20
+const KEY_B_PTR = 24
+const VALUE_B_PTR = 28
+# Cached pool keys
+const POOL_X_KEY_MEM = 40
+const POOL_Y_KEY_MEM = 44
+# Scalars
+const DX_PTR = 48
+const DY_PTR = 49
+const X_PTR = 50
+const Y_PTR = 51
+const SUPPLY_PTR = 52
+const LP_PTR = 53
+const NOTE_IDX_PTR = 54
+const AMOUNT_X_PTR = 55
+const AMOUNT_Y_PTR = 56
+# u128 scratch for the sqrt helper
+const SQRT_N_MEM = 64
+const SQRT_X0_MEM = 68
+const SQRT_X1_MEM = 72
 
-    exec.note::get_sender
-    # => [sender, ASSET]
+# ERRORS
+const ERR_BAD_NOTE_STORAGE = "liquidity note must carry exactly 8 storage elements"
+const ERR_BAD_ADD_ASSETS = "add_liquidity note must carry exactly two input assets"
+const ERR_BAD_REMOVE_ASSETS = "remove_liquidity note must carry exactly one input asset"
+const ERR_WRONG_PAIR = "deposited assets do not match the pool pair"
+const ERR_NOT_LP_TOKEN = "remove_liquidity note asset is not the pool's LP token"
+const ERR_INSUFFICIENT_INITIAL_LIQUIDITY = "initial deposit too small to lock minimum liquidity"
+const ERR_ZERO_LP_MINTED = "deposit mints zero LP tokens"
+const ERR_ZERO_PAYOUT = "burn pays out zero of one pool asset"
+const ERR_EMPTY_POOL = "pool has LP supply but empty reserves"
+const ERR_LP_EXCEEDS_SUPPLY = "burn amount exceeds LP supply"
+const ERR_VALUE_OVERFLOW = "computed value does not fit in a u64"
+const ERR_SLIPPAGE = "slippage higher than user set accepted range"
 
-    push.0 movdn.2 push.0 movdn.2
-    # => [SENDER, ASSET]
+# INTEGER SQUARE ROOT
+# =================================================================================================
 
-    push.BALANCES_SLOT
-    # => [slot, SENDER, ASSET]
+#! One Newton iteration: X1 = (X0 + N / X0) >> 1, operating on the u128 scratch memory.
+#!
+#! Inputs:  []
+#! Outputs: []
+proc isqrt_step
+    # q = n / x0
+    padw push.SQRT_N_MEM mem_loadw_le
+    padw push.SQRT_X0_MEM mem_loadw_le
+    # => [X0, N]
+    exec.u128::div
+    # => [Q]
 
-    exec.account::set_map_item
-    # => [OLD_MAP_ROOT, OLD_MAP_VALUE]
-
-    dropw dropw
-
-    exec.sys::truncate_stack
+    # x1 = (x0 + q) >> 1
+    padw push.SQRT_X0_MEM mem_loadw_le
+    # => [X0, Q]
+    exec.u128::wrapping_add
+    # => [SUM]
+    push.1
+    exec.u128::shr
+    # => [X1]
+    mem_storew_le.SQRT_X1_MEM dropw
     # => []
 end
 
-# => [tag, aux, note_type, execution_hint, RECIPIENT]
-export.withdraw
-    # => [tag, aux, note_type, execution_hint, RECIPIENT]
+#! Computes floor(sqrt(N)) for a u128 value via Newton's method.
+#! Deterministic: no advice-provider input, so the network transaction builder can execute it.
+#!
+#! Inputs:  [N] (u128, least-significant limb on top)
+#! Outputs: [r] (felt, floor(sqrt(N)) always fits in a u64)
+proc isqrt_u128
+    mem_storew_le.SQRT_N_MEM
+    exec.u128::eqz
+    # => [n_is_zero]
+    if.true
+        push.0
+        # => [0]
+    else
+        # initial guess x0 = 2^ceil(bits / 2) where bits = 128 - clz(n).
+        # x0 >= sqrt(n) guarantees the Newton sequence decreases monotonically to floor(sqrt).
+        padw push.SQRT_N_MEM mem_loadw_le
+        exec.u128::clz
+        # => [clz]
+        push.129 swap sub
+        # => [129 - clz]
+        u32split
+        # => [v_lo, v_hi]
+        push.0 push.2
+        # => [2, 0, v_lo, v_hi]
+        exec.u64::div
+        # => [shift_lo, shift_hi]
+        swap drop
+        # => [shift]
+        push.0 push.0 push.0 push.1 movup.4
+        # => [shift, 1, 0, 0, 0]
+        exec.u128::shl
+        # => [X0]
+        mem_storew_le.SQRT_X0_MEM dropw
+        # => []
 
-    call.tx::create_note
+        exec.isqrt_step
+        # loop while x1 < x0
+        padw push.SQRT_X1_MEM mem_loadw_le
+        padw push.SQRT_X0_MEM mem_loadw_le
+        exec.u128::lt
+        while.true
+            # x0 = x1
+            padw push.SQRT_X1_MEM mem_loadw_le
+            mem_storew_le.SQRT_X0_MEM dropw
+            exec.isqrt_step
+            padw push.SQRT_X1_MEM mem_loadw_le
+            padw push.SQRT_X0_MEM mem_loadw_le
+            exec.u128::lt
+        end
+        # => []
+
+        # result = x0; sqrt of a u128 always fits in a u64
+        padw push.SQRT_X0_MEM mem_loadw_le
+        # => [r0, r1, r2, r3]
+        movup.2 eq.0 assert.err=ERR_VALUE_OVERFLOW
+        movup.2 eq.0 assert.err=ERR_VALUE_OVERFLOW
+        swap push.U32_SHIFT mul add
+        # => [r]
+    end
+end
+
+# HELPERS
+# =================================================================================================
+
+#! Computes a * b / d with an exact u128 intermediate product.
+#!
+#! Inputs:  [a, b, d]
+#! Outputs: [q]  (felt; panics if the quotient does not fit in a u64)
+proc mul_div_u64
+    u32split
+    # => [a_lo, a_hi, b, d]
+    movup.2 u32split
+    # => [b_lo, b_hi, a_lo, a_hi, d]
+    exec.u64::widening_mul
+    # => [P (u128), d]
+    movup.4 u32split
+    # => [d_lo, d_hi, P]
+    push.0 push.0 movup.3 movup.3
+    # => [d_lo, d_hi, 0, 0, P]
+    exec.u128::div
+    # => [q0, q1, q2, q3]
+    movup.2 eq.0 assert.err=ERR_VALUE_OVERFLOW
+    movup.2 eq.0 assert.err=ERR_VALUE_OVERFLOW
+    swap push.U32_SHIFT mul add
+    # => [q]
+end
+
+#! Caches the pool asset keys from storage into memory.
+#!
+#! Inputs:  []
+#! Outputs: []
+proc load_pool_keys
+    push.POOL_X_KEY_SLOT[0..2] exec.active_account::get_item
+    mem_storew_le.POOL_X_KEY_MEM dropw
+    push.POOL_Y_KEY_SLOT[0..2] exec.active_account::get_item
+    mem_storew_le.POOL_Y_KEY_MEM dropw
+end
+
+#! Reads the current LP supply from storage into SUPPLY_PTR.
+#!
+#! Inputs:  []
+#! Outputs: []
+proc load_lp_supply
+    push.LP_SUPPLY_SLOT[0..2] exec.active_account::get_item
+    # => [supply, 0, 0, 0]
+    mem_store.SUPPLY_PTR drop drop drop
+    # => []
+end
+
+#! Writes a new LP supply value to storage.
+#!
+#! Inputs:  [new_supply]
+#! Outputs: []
+proc store_lp_supply
+    push.0 push.0 push.0 movup.3
+    # => [new_supply, 0, 0, 0]
+    push.LP_SUPPLY_SLOT[0..2]
+    # => [slot_suffix, slot_prefix, VALUE]
+    exec.native_account::set_item
+    # => [OLD_VALUE]
+    dropw
+    # => []
+end
+
+#! Creates the payout note described by the liquidity note's storage.
+#! Stores the created note index at NOTE_IDX_PTR.
+#!
+#! Inputs:  []
+#! Outputs: []
+proc create_payout_note
+    padw push.RECIPIENT_PTR mem_loadw_le
+    # => [RECIPIENT]
+    mem_load.NOTE_TYPE_PTR
+    mem_load.TAG_PTR
+    # => [tag, note_type, RECIPIENT]
+    exec.output_note::create
     # => [note_idx]
+    mem_store.NOTE_IDX_PTR
+    # => []
+end
 
-    exec.note::get_sender
-    # => [sender, note_idx]
+#! Moves `amount` of the pool asset whose key word is cached at `key_ptr` from the
+#! account vault into the payout note.
+#!
+#! Inputs:  [amount, key_ptr]
+#! Outputs: []
+proc pay_out_pool_asset
+    push.0 push.0 push.0 movup.3
+    # => [ASSET_VALUE, key_ptr]
+    movup.4 padw movup.4 mem_loadw_le
+    # => [ASSET_KEY, ASSET_VALUE]
+    dupw.1 dupw.1
+    # => [KEY, VALUE, KEY, VALUE]
+    exec.native_account::remove_asset dropw
+    # => [KEY, VALUE]
+    mem_load.NOTE_IDX_PTR movdn.8
+    # => [KEY, VALUE, note_idx]
+    exec.output_note::add_asset
+    # => []
+end
 
-    push.0 movdn.2 push.0 movdn.2
-    # => [SENDER]
+# LIQUIDITY PROVISION
+# =================================================================================================
 
-    push.BALANCES_SLOT
-    # => [slot, SENDER, note_idx]
+#! Adds liquidity to the pool. Expects to be invoked (via call) from a note script while
+#! an add-liquidity note is active. The note must carry exactly the two pool assets.
+#!
+#! LP tokens are minted directly by this account (the AMM account is the LP faucet) into a
+#! payout note for the recipient encoded in the note storage.
+#!
+#! Uniswap-v2 semantics:
+#!   first deposit:  lp = sqrt(dx * dy) - MIN_LIQUIDITY, supply = sqrt(dx * dy)
+#!   later deposits: lp = min(dx * S / x, dy * S / y),   supply = S + lp
+#!
+#! Liquidity note storage layout (8 felts):
+#!   [0..3] RECIPIENT   P2ID recipient digest for the LP payout note
+#!   [4]    tag         note tag for the payout note
+#!   [5]    note_type   note type for the payout note
+#!   [6]    min_lp_out  slippage bound on minted LP
+#!   [7]    pad
+#!
+#! Inputs:  []
+#! Outputs: []
+pub proc add_liquidity
+    # load note storage and the two deposited assets
+    push.NOTE_STORAGE_PTR exec.active_note::get_storage
+    eq.8 assert.err=ERR_BAD_NOTE_STORAGE
+    push.ASSETS_PTR exec.active_note::get_assets
+    eq.2 assert.err=ERR_BAD_ADD_ASSETS
+    # => []
 
-    exec.account::get_map_item
-    # => [ASSET, note_idx]
+    exec.load_pool_keys
 
-    call.wallet::move_asset_to_note
-    # => [ASSET, note_idx]
+    # identify which deposited asset is X and which is Y
+    padw push.KEY_A_PTR mem_loadw_le
+    padw push.POOL_X_KEY_MEM mem_loadw_le
+    eqw movdn.8 dropw dropw
+    # => [a_is_x]
+    if.true
+        padw push.KEY_B_PTR mem_loadw_le
+        padw push.POOL_Y_KEY_MEM mem_loadw_le
+        assert_eqw.err=ERR_WRONG_PAIR
+        mem_load.VALUE_A_PTR mem_store.DX_PTR
+        mem_load.VALUE_B_PTR mem_store.DY_PTR
+    else
+        padw push.KEY_A_PTR mem_loadw_le
+        padw push.POOL_Y_KEY_MEM mem_loadw_le
+        assert_eqw.err=ERR_WRONG_PAIR
+        padw push.KEY_B_PTR mem_loadw_le
+        padw push.POOL_X_KEY_MEM mem_loadw_le
+        assert_eqw.err=ERR_WRONG_PAIR
+        mem_load.VALUE_B_PTR mem_store.DX_PTR
+        mem_load.VALUE_A_PTR mem_store.DY_PTR
+    end
+    # => []
 
-    dropw drop
+    # pre-deposit reserves
+    padw push.POOL_X_KEY_MEM mem_loadw_le
+    exec.active_account::get_balance
+    mem_store.X_PTR
+    padw push.POOL_Y_KEY_MEM mem_loadw_le
+    exec.active_account::get_balance
+    mem_store.Y_PTR
+    # => []
+
+    exec.load_lp_supply
+
+    # compute minted LP
+    mem_load.SUPPLY_PTR eq.0
+    if.true
+        # first deposit: lp = sqrt(dx * dy) - MIN_LIQUIDITY; supply becomes sqrt(dx * dy)
+        mem_load.DX_PTR u32split
+        mem_load.DY_PTR u32split
+        # => [dy_lo, dy_hi, dx_lo, dx_hi]
+        exec.u64::widening_mul
+        # => [N] (u128)
+        exec.isqrt_u128
+        # => [r]
+        dup push.MIN_LIQUIDITY gt assert.err=ERR_INSUFFICIENT_INITIAL_LIQUIDITY
+        # => [r]
+        dup push.MIN_LIQUIDITY sub
+        # => [lp, r]
+        mem_store.LP_PTR
+        # => [r]  (new supply includes the locked minimum liquidity)
+        exec.store_lp_supply
+        # => []
+    else
+        # later deposit: pool with supply must have non-empty reserves
+        mem_load.X_PTR neq.0 assert.err=ERR_EMPTY_POOL
+        mem_load.Y_PTR neq.0 assert.err=ERR_EMPTY_POOL
+
+        # lp = min(dx * S / x, dy * S / y)
+        mem_load.X_PTR mem_load.SUPPLY_PTR mem_load.DX_PTR
+        # => [dx, S, x]
+        exec.mul_div_u64
+        # => [lp_x]
+        mem_load.Y_PTR mem_load.SUPPLY_PTR mem_load.DY_PTR
+        # => [dy, S, y, lp_x]
+        exec.mul_div_u64
+        # => [lp_y, lp_x]
+        u32split movup.2 u32split
+        # => [lp_x_lo, lp_x_hi, lp_y_lo, lp_y_hi]
+        exec.u64::min
+        # => [lp_lo, lp_hi]
+        swap push.U32_SHIFT mul add
+        # => [lp]
+        dup neq.0 assert.err=ERR_ZERO_LP_MINTED
+        dup mem_store.LP_PTR
+        # => [lp]
+        mem_load.SUPPLY_PTR add
+        # => [new_supply]
+        exec.store_lp_supply
+        # => []
+    end
+
+    # slippage bound on minted LP
+    mem_load.LP_PTR mem_load.MIN_A_PTR gte assert.err=ERR_SLIPPAGE
+    # => []
+
+    # receive both deposited assets into the pool vault
+    padw push.VALUE_A_PTR mem_loadw_le
+    padw push.KEY_A_PTR mem_loadw_le
+    exec.native_account::add_asset dropw
+    padw push.VALUE_B_PTR mem_loadw_le
+    padw push.KEY_B_PTR mem_loadw_le
+    exec.native_account::add_asset dropw
+    # => []
+
+    # create the LP payout note and mint the LP tokens straight into it
+    exec.create_payout_note
+    mem_load.LP_PTR
+    # => [lp]
+    exec.faucet::create_fungible_asset
+    # => [LP_KEY, LP_VALUE]
+    dupw.1 dupw.1
+    # => [KEY, VALUE, KEY, VALUE]
+    exec.faucet::mint
+    # => [KEY, VALUE]
+    mem_load.NOTE_IDX_PTR movdn.8
+    # => [KEY, VALUE, note_idx]
+    exec.output_note::add_asset
+    # => []
 
     exec.sys::truncate_stack
+end
+
+#! Removes liquidity from the pool. Expects to be invoked (via call) from a note script
+#! while a remove-liquidity note is active. The note must carry exactly one asset: the
+#! pool's own LP token. The LP tokens are burned and the pro-rata share of both pool
+#! assets is paid out into a single note for the recipient encoded in the note storage.
+#!
+#!   amount_x = lp * x / S
+#!   amount_y = lp * y / S
+#!   supply   = S - lp
+#!
+#! Liquidity note storage layout (8 felts):
+#!   [0..3] RECIPIENT   P2ID recipient digest for the payout note
+#!   [4]    tag         note tag for the payout note
+#!   [5]    note_type   note type for the payout note
+#!   [6]    min_x_out   slippage bound on the X payout
+#!   [7]    min_y_out   slippage bound on the Y payout
+#!
+#! Inputs:  []
+#! Outputs: []
+pub proc remove_liquidity
+    # load note storage and the LP asset
+    push.NOTE_STORAGE_PTR exec.active_note::get_storage
+    eq.8 assert.err=ERR_BAD_NOTE_STORAGE
+    push.ASSETS_PTR exec.active_note::get_assets
+    eq.1 assert.err=ERR_BAD_REMOVE_ASSETS
     # => []
+
+    # the asset's faucet must be this account (the LP faucet)
+    padw push.KEY_A_PTR mem_loadw_le
+    exec.asset::key_into_faucet_id
+    # => [lp_faucet_suffix, lp_faucet_prefix]
+    exec.active_account::get_id
+    # => [account_suffix, account_prefix, lp_faucet_suffix, lp_faucet_prefix]
+    movup.2 eq assert.err=ERR_NOT_LP_TOKEN
+    eq assert.err=ERR_NOT_LP_TOKEN
+    # => []
+
+    exec.load_pool_keys
+    exec.load_lp_supply
+
+    # lp amount burned, bounded by supply (lp <= S)
+    mem_load.VALUE_A_PTR mem_store.LP_PTR
+    mem_load.LP_PTR mem_load.SUPPLY_PTR lte assert.err=ERR_LP_EXCEEDS_SUPPLY
+    # => []
+
+    # current reserves
+    padw push.POOL_X_KEY_MEM mem_loadw_le
+    exec.active_account::get_balance
+    mem_store.X_PTR
+    padw push.POOL_Y_KEY_MEM mem_loadw_le
+    exec.active_account::get_balance
+    mem_store.Y_PTR
+    # => []
+
+    # pro-rata payouts
+    mem_load.SUPPLY_PTR mem_load.X_PTR mem_load.LP_PTR
+    # => [lp, x, S]
+    exec.mul_div_u64
+    mem_store.AMOUNT_X_PTR
+    mem_load.SUPPLY_PTR mem_load.Y_PTR mem_load.LP_PTR
+    # => [lp, y, S]
+    exec.mul_div_u64
+    mem_store.AMOUNT_Y_PTR
+    # => []
+
+    mem_load.AMOUNT_X_PTR neq.0 assert.err=ERR_ZERO_PAYOUT
+    mem_load.AMOUNT_Y_PTR neq.0 assert.err=ERR_ZERO_PAYOUT
+    mem_load.AMOUNT_X_PTR mem_load.MIN_A_PTR gte assert.err=ERR_SLIPPAGE
+    mem_load.AMOUNT_Y_PTR mem_load.MIN_B_PTR gte assert.err=ERR_SLIPPAGE
+    # => []
+
+    # burn the LP tokens (straight from the transaction inputs; never enters the vault)
+    padw push.VALUE_A_PTR mem_loadw_le
+    padw push.KEY_A_PTR mem_loadw_le
+    # => [LP_KEY, LP_VALUE]
+    exec.faucet::burn
+    # => []
+
+    # decrement the LP supply
+    mem_load.LP_PTR mem_load.SUPPLY_PTR swap sub
+    # => [new_supply]
+    exec.store_lp_supply
+    # => []
+
+    # pay out both pool assets into a single note
+    exec.create_payout_note
+    push.POOL_X_KEY_MEM mem_load.AMOUNT_X_PTR
+    # => [amount_x, pool_x_key_ptr]
+    exec.pay_out_pool_asset
+    push.POOL_Y_KEY_MEM mem_load.AMOUNT_Y_PTR
+    # => [amount_y, pool_y_key_ptr]
+    exec.pay_out_pool_asset
+    # => []
+
+    exec.sys::truncate_stack
 end

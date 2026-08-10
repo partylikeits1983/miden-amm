@@ -1,216 +1,270 @@
-use.miden::account
-use.miden::contracts::wallets::basic->wallet
-use.miden::note
-use.miden::tx
-use.std::math::u64
-use.std::sys
+use miden::protocol::active_account
+use miden::protocol::native_account
+use miden::protocol::active_note
+use miden::protocol::output_note
+use miden::core::math::u64
+use miden::core::math::u128
+use miden::core::sys
 
 # CONSTANTS
 # =================================================================================================
 
-const.MAX_U32=0x0000000100000000
-const.BASE=1000 # 1e3
-const.DIV=1000 # 1e3
+# Fee is expressed in basis points; fee_bps is fixed in the config slot at account creation.
+const FEE_DENOM = 10000
 
-# Memory Addresses for AMM calculations
-const.POOL_X = 0x0040
-const.POOL_Y = 0x0041
-const.DX_IN = 0x0042
-const.DY_OUT = 0x0043
+# Storage slots (contributed by this component)
+const POOL_X_KEY_SLOT = word("miden_amm::amm::pool_x_key")
+const POOL_Y_KEY_SLOT = word("miden_amm::amm::pool_y_key")
+const CONFIG_SLOT = word("miden_amm::amm::config")
 
-# Run time u64 memory addresses
-const.DX_MUL_Y_BASE = 100
-const.DX_PLUS_Y = 104
-
-# Memory Addresses
-const.ASSET_IN=200
-const.ASSET_OUT=212
+# Memory layout (word-aligned)
+# Swap note storage: [ASSET_OUT_KEY (4), P2ID_RECIPIENT (4), min_amount_out, tag, note_type, pad]
+const NOTE_STORAGE_PTR = 0
+const OUT_KEY_PTR = 0
+const RECIPIENT_PTR = 4
+const MIN_OUT_PTR = 8
+const TAG_PTR = 9
+const NOTE_TYPE_PTR = 10
+# Incoming note asset: ASSET_KEY at +0, ASSET_VALUE at +4
+const ASSET_IN_PTR = 16
+const IN_KEY_PTR = 16
+const IN_VALUE_PTR = 20
+# Scratch
+const POOL_X_KEY_MEM = 32
+const POOL_Y_KEY_MEM = 36
+const DY_PTR = 40
+const CALC_DX = 48
+const CALC_X = 49
+const CALC_Y = 50
+const CALC_FEE = 51
+const CALC_DXF_LO = 52
+const CALC_DXF_HI = 53
+const CALC_NUM = 56
+const CALC_DEN = 60
 
 # ERRORS
-const.OVERFLOW="value larger than 32 bits"
-const.ERR_SLIPPAGE="slippage higher than user set accepted range"
-
-# Storage slots
-const.BALANCES_SLOT=0
+const ERR_BAD_NOTE_STORAGE = "swap note must carry exactly 12 storage elements"
+const ERR_BAD_NOTE_ASSETS = "swap note must carry exactly one input asset"
+const ERR_WRONG_PAIR = "swap assets do not match the pool pair"
+const ERR_FEE_TOO_LARGE = "fee_bps exceeds the fee denominator"
+const ERR_AMOUNT_TOO_LARGE = "swap amount exceeds the supported range"
+const ERR_DY_OVERFLOW = "computed output amount does not fit in a u64"
+const ERR_ZERO_OUTPUT = "computed output amount is zero"
+const ERR_SLIPPAGE = "slippage higher than user set accepted range"
 
 # AMM CALCULATION
 # =================================================================================================
 
-#! Calculates the amount of asset Y to return given input of asset X
-#! Formula: dy = (dx * y) / (dx + x)
+#! Calculates the amount of asset Y returned for an input of asset X, applying the pool fee.
+#! Formula: dy = (dx * (FEE_DENOM - fee_bps) * y) / (x * FEE_DENOM + dx * (FEE_DENOM - fee_bps))
 #!
-#! Assumes input values are base 1e3
-#! Returns dy as fixed point 1e3
+#! All intermediate products are computed in u128, so no overflow is possible for any
+#! valid fungible amounts as long as dx * (FEE_DENOM - fee_bps) fits in a u64.
 #!
-#! Inputs: [x, y, dx]
+#! Inputs:  [dx, x, y, fee_bps]
 #! Outputs: [dy]
-export.get_amount_y_out
-    mem_store.POOL_X
-    mem_store.POOL_Y
-    mem_store.DX_IN
+pub proc get_amount_y_out
+    mem_store.CALC_DX
+    mem_store.CALC_X
+    mem_store.CALC_Y
+    mem_store.CALC_FEE
     # => []
 
-    mem_load.DX_IN
+    # sanity: fee_bps <= FEE_DENOM
+    mem_load.CALC_FEE push.FEE_DENOM lte assert.err=ERR_FEE_TOO_LARGE
+
+    # fee complement: feec = FEE_DENOM - fee_bps
+    mem_load.CALC_FEE push.FEE_DENOM swap sub
+    # => [feec]
+
+    # dx_f = dx * feec (must fit in u64)
     u32split
-    # => [dx_high, dx_low]
-
-    mem_load.POOL_Y
-    u32split
-    # => [y_high, y_low, dx_high, dx_low]
-
-    exec.u64::wrapping_mul
-    # => [dxy_high, dyx_low]
-
-    push.0.0
-    # => [0, 0, dxyb_high, dyxb_low]
-
-    mem_storew.DX_MUL_Y_BASE dropw
+    # => [feec_lo, feec_hi]
+    mem_load.CALC_DX u32split
+    # => [dx_lo, dx_hi, feec_lo, feec_hi]
+    exec.u64::widening_mul
+    # => [f0, f1, f2, f3]  (u128, f0 least significant)
+    movup.2 eq.0 assert.err=ERR_AMOUNT_TOO_LARGE
+    movup.2 eq.0 assert.err=ERR_AMOUNT_TOO_LARGE
+    # => [f0, f1]
+    mem_store.CALC_DXF_LO
+    mem_store.CALC_DXF_HI
     # => []
 
-    mem_load.DX_IN
-    u32split
-    # => [dx_high, dx_low]
+    # NUM = y * dx_f  (u64 x u64 -> u128, exact)
+    mem_load.CALC_Y u32split
+    # => [y_lo, y_hi]
+    mem_load.CALC_DXF_HI mem_load.CALC_DXF_LO
+    # => [dxf_lo, dxf_hi, y_lo, y_hi]
+    exec.u64::widening_mul
+    # => [NUM] (u128)
+    mem_storew_le.CALC_NUM dropw
+    # => []
 
-    mem_load.POOL_Y
-    u32split
-    # => [dx_high, dx_low, y_high, y_low]
+    # DEN = x * FEE_DENOM + dx_f  (u128, cannot overflow)
+    mem_load.CALC_X u32split
+    # => [x_lo, x_hi]
+    push.0 push.FEE_DENOM
+    # => [den_lo, den_hi, x_lo, x_hi]
+    exec.u64::widening_mul
+    # => [DEN'] (u128)
+    push.0 push.0 mem_load.CALC_DXF_HI mem_load.CALC_DXF_LO
+    # => [dxf_lo, dxf_hi, 0, 0, DEN']
+    exec.u128::wrapping_add
+    # => [DEN] (u128)
+    mem_storew_le.CALC_DEN dropw
+    # => []
 
-    exec.u64::wrapping_add
-    # => [sum_dx_y_high, sum_dx_y_low]
+    # dy = NUM / DEN
+    padw push.CALC_NUM mem_loadw_le
+    padw push.CALC_DEN mem_loadw_le
+    # => [DEN, NUM]
+    exec.u128::div
+    # => [q0, q1, q2, q3]
+    movup.2 eq.0 assert.err=ERR_DY_OVERFLOW
+    movup.2 eq.0 assert.err=ERR_DY_OVERFLOW
+    # => [q0, q1]
+    swap push.0x0000000100000000 mul add
+    # => [dy]
+end
 
-    padw mem_loadw.DX_MUL_Y_BASE drop drop
-    # => [dxyb_high, dyxb_low, sum_dx_y_high, sum_dx_y_low]
+# DEPLOYMENT
+# =================================================================================================
 
-    movup.3 movup.3
-    # => [sum_dx_y_high, sum_dx_y_low, dxyb_high, dyxb_low]
+#! Minimal deployment entry point used by the deploy transaction script.
+#! Sanity-checks the immutable pool configuration written at account creation.
+#!
+#! Inputs:  []
+#! Outputs: []
+pub proc init
+    # fee must be a valid basis-point value
+    push.CONFIG_SLOT[0..2] exec.active_account::get_item
+    # => [fee_bps, 0, 0, 0]
+    push.FEE_DENOM lte assert.err=ERR_FEE_TOO_LARGE
+    drop drop drop
+    # => []
 
-    exec.u64::div
-    # => [dy_base_high, dy_base_low]
-
-    eq.0 assert.err=OVERFLOW
+    # the two pool asset keys must be distinct
+    push.POOL_X_KEY_SLOT[0..2] exec.active_account::get_item
+    push.POOL_Y_KEY_SLOT[0..2] exec.active_account::get_item
+    # => [POOL_Y_KEY, POOL_X_KEY]
+    eqw movdn.8 dropw dropw
+    # => [keys_equal]
+    eq.0 assert.err=ERR_WRONG_PAIR
 
     exec.sys::truncate_stack
 end
 
-# procedure to deploy network account onchain
-export.deploy_contract
-    push.0.0.0.0
-    # => [KEY]
+# SWAP
+# =================================================================================================
 
-    push.BALANCES_SLOT
-    # => [slot, KEY]
-
-    exec.account::get_map_item
-    # => [VALUE]
-
-    padw
-    # => [EMPTY_WORD, VALUE]
-
-    assert_eqw
+#! Swaps the note's input asset against the pool and sends the output asset to the
+#! recipient encoded in the note storage (a precomputed P2ID recipient digest).
+#!
+#! Expects to be invoked (via call) from a note script while a swap note is active.
+#! Reads everything it needs from the active note; nothing is passed on the stack.
+#!
+#! Swap note storage layout (12 felts):
+#!   [0..3]  ASSET_OUT_KEY   vault key of the requested output asset
+#!   [4..7]  RECIPIENT       P2ID recipient digest for the payout note
+#!   [8]     min_amount_out  slippage bound
+#!   [9]     tag             note tag for the payout note
+#!   [10]    note_type       note type for the payout note
+#!   [11]    pad
+#!
+#! Inputs:  []
+#! Outputs: []
+pub proc swap
+    # load the note storage and the input asset into memory
+    push.NOTE_STORAGE_PTR exec.active_note::get_storage
+    eq.12 assert.err=ERR_BAD_NOTE_STORAGE
+    push.ASSET_IN_PTR exec.active_note::get_assets
+    eq.1 assert.err=ERR_BAD_NOTE_ASSETS
     # => []
 
-    push.1.1.1.1
-    # => [VALUE]
-
-    padw
-    # => [KEY, VALUE]
-
-    push.BALANCES_SLOT
-    # => [slot]
-
-    exec.account::set_map_item
-    # => [OLD_MAP_ROOT, OLD_MAP_VALUE]
-
-    dropw dropw
-    # => []
-end
-
-# => [ASSET_IN, ASSET_OUT]
-export.swap
-    mem_storew.ASSET_IN
-
-    movup.2 drop movup.2 drop
-    # => [asset_in_prefix, asset_in_suffix, ASSET_OUT]
-
-    # AMM computation
-
-    # get balance faucet_id_in
-    call.account::get_balance
-    # => [pool_x_balance, ASSET_OUT]
-
-    mem_store.POOL_X
-    # => [ASSET_OUT]
-
-    mem_storew.ASSET_OUT
-    # => [ASSET_OUT]
-
-    movup.2 drop movup.2 drop
-    # => [asset_out_prefix, asset_out_suffix]
-
-    # get balance faucet_id_out
-    call.account::get_balance
-    # => [asset_out_balance]
-
-    mem_store.POOL_Y
+    # cache the pool asset keys
+    push.POOL_X_KEY_SLOT[0..2] exec.active_account::get_item
+    mem_storew_le.POOL_X_KEY_MEM dropw
+    push.POOL_Y_KEY_SLOT[0..2] exec.active_account::get_item
+    mem_storew_le.POOL_Y_KEY_MEM dropw
     # => []
 
-    mem_loadw.ASSET_IN
-    # => [ASSET_IN]
+    # validate the direction of the swap: {in, out} must be {X, Y} or {Y, X}
+    padw push.IN_KEY_PTR mem_loadw_le
+    padw push.POOL_X_KEY_MEM mem_loadw_le
+    eqw movdn.8 dropw dropw
+    # => [in_is_x]
+    if.true
+        padw push.OUT_KEY_PTR mem_loadw_le
+        padw push.POOL_Y_KEY_MEM mem_loadw_le
+        assert_eqw.err=ERR_WRONG_PAIR
+    else
+        padw push.IN_KEY_PTR mem_loadw_le
+        padw push.POOL_Y_KEY_MEM mem_loadw_le
+        assert_eqw.err=ERR_WRONG_PAIR
+        padw push.OUT_KEY_PTR mem_loadw_le
+        padw push.POOL_X_KEY_MEM mem_loadw_le
+        assert_eqw.err=ERR_WRONG_PAIR
+    end
+    # => []
 
-    drop drop drop
-    # => [dx]
+    # pre-swap reserves: x = balance(asset_in), y = balance(asset_out)
+    # (the incoming note asset has not been added to the vault yet)
+    padw push.IN_KEY_PTR mem_loadw_le
+    exec.active_account::get_balance
+    # => [x]
+    padw push.OUT_KEY_PTR mem_loadw_le
+    exec.active_account::get_balance
+    # => [y, x]
 
-    dup mem_store.DX_IN
-    mem_load.POOL_Y
-    mem_load.POOL_X
-    # => [x, y, dx]
+    # fee_bps from the config slot
+    push.CONFIG_SLOT[0..2] exec.active_account::get_item
+    # => [fee_bps, 0, 0, 0, y, x]
+    movdn.3 drop drop drop
+    # => [fee_bps, y, x]
 
+    # dy = get_amount_y_out(dx, x, y, fee_bps)
+    movdn.2 swap
+    # => [x, y, fee_bps]
+    mem_load.IN_VALUE_PTR
+    # => [dx, x, y, fee_bps]
     exec.get_amount_y_out
     # => [dy]
 
-    dup mem_store.DY_OUT
+    # dy must be non-zero and satisfy the user's slippage bound
+    dup neq.0 assert.err=ERR_ZERO_OUTPUT
+    dup mem_load.MIN_OUT_PTR gte assert.err=ERR_SLIPPAGE
     # => [dy]
-
-    # checking acceptable slippage
-
-    padw mem_loadw.ASSET_OUT drop drop drop
-    # => [min_requested_out, dy]
-
-    gte assert.err=ERR_SLIPPAGE
+    mem_store.DY_PTR
     # => []
 
-    # consume ASSET_IN
-
-    mem_loadw.ASSET_IN
-    # => [ASSET_IN]
-
-    call.wallet::receive_asset dropw
+    # add the input asset to the pool vault
+    padw push.IN_VALUE_PTR mem_loadw_le
+    padw push.IN_KEY_PTR mem_loadw_le
+    # => [ASSET_IN_KEY, ASSET_IN_VALUE]
+    exec.native_account::add_asset dropw
     # => []
 
-    # create requested output note
-
-    push.0 exec.note::get_inputs drop
-    # => []
-
-    mem_loadw.4 padw mem_loadw.0
-    # => [tag, aux, note_type, execution_hint, RECIPIENT]
-
-    call.tx::create_note
+    # create the payout note for the swapper
+    padw push.RECIPIENT_PTR mem_loadw_le
+    # => [RECIPIENT]
+    mem_load.NOTE_TYPE_PTR
+    mem_load.TAG_PTR
+    # => [tag, note_type, RECIPIENT]
+    exec.output_note::create
     # => [note_idx]
 
-    # Add ASSET_OUT (with equal to or better than rate)
+    # move dy of the output asset from the vault into the payout note
+    push.0 push.0 push.0 mem_load.DY_PTR
+    # => [ASSET_OUT_VALUE, note_idx]
+    padw push.OUT_KEY_PTR mem_loadw_le
+    # => [ASSET_OUT_KEY, ASSET_OUT_VALUE, note_idx]
+    dupw.1 dupw.1
+    # => [KEY, VALUE, KEY, VALUE, note_idx]
+    exec.native_account::remove_asset dropw
+    # => [KEY, VALUE, note_idx]
+    exec.output_note::add_asset
+    # => []
 
-    mem_loadw.ASSET_OUT
-    # => [ASSET_OUT]
-
-    mem_load.DY_OUT
-    # => [dy, ASSET_OUT]
-
-    swap.4 drop
-    # => [ASSET_OUT]
-
-    call.wallet::move_asset_to_note
-    # => [ASSET, note_idx]
-
-    dropw dropw
+    exec.sys::truncate_stack
 end

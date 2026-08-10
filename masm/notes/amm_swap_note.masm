@@ -1,0 +1,11 @@
+use external_contract::amm_contract
+
+#! Network swap note: all logic (note storage, assets, validation, pricing, payout)
+#! lives in the AMM account's swap procedure.
+#!
+#! Inputs:  []
+#! Outputs: []
+@note_script
+pub proc main
+    call.amm_contract::swap
+end

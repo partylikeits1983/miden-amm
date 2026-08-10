@@ -1,0 +1,11 @@
+use external_contract::liquidity_contract
+
+#! Network add-liquidity note: carries the two pool assets; the account procedure
+#! mints LP tokens into a payout note for the recipient encoded in the note storage.
+#!
+#! Inputs:  []
+#! Outputs: []
+@note_script
+pub proc main
+    call.liquidity_contract::add_liquidity
+end

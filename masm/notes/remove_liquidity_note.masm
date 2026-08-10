@@ -1,0 +1,11 @@
+use external_contract::liquidity_contract
+
+#! Network remove-liquidity note: carries LP tokens; the account procedure burns them
+#! and pays out the pro-rata share of both pool assets into a single payout note.
+#!
+#! Inputs:  []
+#! Outputs: []
+@note_script
+pub proc main
+    call.liquidity_contract::remove_liquidity
+end
