@@ -20,7 +20,8 @@ use miden_client::{
     keystore::{FilesystemKeyStore, Keystore},
     note::{
         NetworkAccountTarget, Note, NoteAssets, NoteAttachments, NoteExecutionHint, NoteRecipient,
-        NoteScript, NoteStorage, NoteTag, NoteType, P2idNoteStorage, PartialNoteMetadata,
+        NoteScript, NoteStorage, NoteTag, NoteType, P2idNote, P2idNoteStorage,
+        PartialNoteMetadata,
     },
     store::TransactionFilter,
     transaction::{TransactionId, TransactionRequestBuilder, TransactionScript, TransactionStatus},
@@ -37,7 +38,9 @@ pub const MIN_LIQUIDITY: u64 = 1_000;
 
 /// MASM sources, resolved at compile time so binaries/tests are CWD-independent.
 pub const AMM_CODE: &str = include_str!("../masm/accounts/amm.masm");
-pub const LIQUIDITY_CODE: &str = include_str!("../masm/accounts/liquidity.masm");
+/// Raw liquidity component source with a `{p2id_script_root}` placeholder — always compile
+/// via [`liquidity_code`], which injects the real P2ID script root.
+pub const LIQUIDITY_CODE_TEMPLATE: &str = include_str!("../masm/accounts/liquidity.masm");
 pub const SWAP_NOTE_CODE: &str = include_str!("../masm/notes/amm_swap_note.masm");
 pub const ADD_LIQUIDITY_NOTE_CODE: &str = include_str!("../masm/notes/add_liquidity_note.masm");
 pub const REMOVE_LIQUIDITY_NOTE_CODE: &str =
@@ -47,6 +50,14 @@ pub const DEPLOY_SCRIPT_CODE: &str = include_str!("../masm/scripts/deploy_script
 /// Library namespaces the MASM modules are compiled under.
 pub const AMM_CONTRACT_NS: &str = "external_contract::amm_contract";
 pub const LIQUIDITY_CONTRACT_NS: &str = "external_contract::liquidity_contract";
+
+/// The liquidity component source with the P2ID script root injected. The component
+/// computes payout recipients in-VM (bound to the note sender), which requires the
+/// canonical P2ID note-script root as a push-word constant.
+pub fn liquidity_code() -> String {
+    let root = Word::from(P2idNote::script_root());
+    LIQUIDITY_CODE_TEMPLATE.replace("{p2id_script_root}", &format!("{root}"))
+}
 
 /// Named storage slots of the AMM account.
 pub fn pool_x_key_slot() -> StorageSlotName {
@@ -159,13 +170,14 @@ pub fn build_amm_account(
         .context("linking amm contract into swap note script")?
         .compile_note_script(SWAP_NOTE_CODE)
         .context("compiling swap note script")?;
+    let liquidity_source = liquidity_code();
     let add_liquidity_note_script = CodeBuilder::new()
-        .with_linked_module(LIQUIDITY_CONTRACT_NS, LIQUIDITY_CODE)
+        .with_linked_module(LIQUIDITY_CONTRACT_NS, liquidity_source.as_str())
         .context("linking liquidity contract into add-liquidity note script")?
         .compile_note_script(ADD_LIQUIDITY_NOTE_CODE)
         .context("compiling add-liquidity note script")?;
     let remove_liquidity_note_script = CodeBuilder::new()
-        .with_linked_module(LIQUIDITY_CONTRACT_NS, LIQUIDITY_CODE)
+        .with_linked_module(LIQUIDITY_CONTRACT_NS, liquidity_source.as_str())
         .context("linking liquidity contract into remove-liquidity note script")?
         .compile_note_script(REMOVE_LIQUIDITY_NOTE_CODE)
         .context("compiling remove-liquidity note script")?;
@@ -201,7 +213,7 @@ pub fn build_amm_account(
 
     // liquidity component: LP mint/burn + supply tracking
     let liquidity_component_code = CodeBuilder::new()
-        .compile_component_code(LIQUIDITY_CONTRACT_NS, LIQUIDITY_CODE)
+        .compile_component_code(LIQUIDITY_CONTRACT_NS, liquidity_source.as_str())
         .context("compiling liquidity component")?;
     let liquidity_component = AccountComponent::new(
         liquidity_component_code,
@@ -249,9 +261,16 @@ pub fn build_amm_account(
 // =================================================================================================
 
 /// The P2ID payout note the AMM will create when it consumes a swap / liquidity note.
-/// `recipient`, `tag` and `note_type` are encoded into the input note's storage; tests and
-/// clients can reconstruct the full expected note once the payout amounts are known.
+///
+/// For SWAP notes the recipient digest is encoded in the note storage (the swapper may
+/// direct the output anywhere). For LIQUIDITY notes the payout is sender-bound: the AMM
+/// derives the recipient in-VM from the note's sender, and only the serial number comes
+/// from note storage — so `target` MUST be the account that submits the note.
+///
+/// Tests and clients reconstruct the full expected note once payout amounts are known.
 pub struct PayoutInfo {
+    pub target: AccountId,
+    pub serial_num: Word,
     pub recipient: NoteRecipient,
     pub tag: NoteTag,
     pub note_type: NoteType,
@@ -267,6 +286,8 @@ impl PayoutInfo {
     /// they constructed the recipient themselves (serial number, P2ID storage and script).
     pub fn new(target: AccountId, serial_num: Word) -> Self {
         PayoutInfo {
+            target,
+            serial_num,
             recipient: P2idNoteStorage::new(target).into_recipient(serial_num),
             tag: NoteTag::with_account_target(target),
             note_type: NoteType::Private,
@@ -351,24 +372,38 @@ pub fn create_swap_note(
 }
 
 /// Storage layout shared by the two liquidity notes (8 felts) — must match `liquidity.masm`:
-///   [0..3] payout RECIPIENT digest, [4] payout tag, [5] payout note type,
-///   [6] min_a (min_lp_out for add, min_x_out for remove), [7] min_b (min_y_out for remove)
-fn liquidity_note_storage(payout: &PayoutInfo, min_a: u64, min_b: u64) -> Vec<Felt> {
-    let recipient_digest = payout.recipient.digest();
-    vec![
-        recipient_digest[0],
-        recipient_digest[1],
-        recipient_digest[2],
-        recipient_digest[3],
-        payout.tag_felt(),
-        payout.note_type_felt(),
+///   [0..3] payout note SERIAL_NUM, [4] min_a (min_lp_out for add, min_x_out for remove),
+///   [5] min_b (min_y_out for remove), [6..7] pad.
+///
+/// The payout recipient/tag are NOT part of the storage: the AMM derives them in-VM from
+/// the note's sender, so `payout.target` must equal the submitting account.
+fn liquidity_note_storage(
+    sender: AccountId,
+    payout: &PayoutInfo,
+    min_a: u64,
+    min_b: u64,
+) -> Result<Vec<Felt>> {
+    anyhow::ensure!(
+        payout.target == sender,
+        "liquidity payouts are sender-bound: payout target {} != note sender {}",
+        payout.target.to_hex(),
+        sender.to_hex()
+    );
+    Ok(vec![
+        payout.serial_num[0],
+        payout.serial_num[1],
+        payout.serial_num[2],
+        payout.serial_num[3],
         Felt::new_unchecked(min_a),
         Felt::new_unchecked(min_b),
-    ]
+        Felt::new_unchecked(0),
+        Felt::new_unchecked(0),
+    ])
 }
 
 /// Creates an add-liquidity note carrying both pool assets. The AMM mints at least
-/// `min_lp_out` LP tokens into a P2ID payout note for the depositor.
+/// `min_lp_out` LP tokens into a private P2ID payout note bound to the depositor
+/// (the sender of this note).
 pub fn create_add_liquidity_note(
     sender: AccountId,
     amm_id: AccountId,
@@ -379,7 +414,7 @@ pub fn create_add_liquidity_note(
     add_liquidity_note_script: NoteScript,
     serial_num: Word,
 ) -> Result<Note> {
-    let storage = liquidity_note_storage(payout, min_lp_out, 0);
+    let storage = liquidity_note_storage(sender, payout, min_lp_out, 0)?;
     let assets = NoteAssets::new(vec![asset_x.into(), asset_y.into()])
         .context("building add-liquidity note assets")?;
     build_amm_network_note(
@@ -394,7 +429,8 @@ pub fn create_add_liquidity_note(
 
 /// Creates a remove-liquidity note carrying `lp_amount` LP tokens (the LP faucet is the AMM
 /// account itself). The AMM burns them and pays out at least `min_x_out` / `min_y_out` of
-/// the pool assets into a single P2ID payout note.
+/// the pool assets into a single private P2ID payout note bound to the withdrawer
+/// (the sender of this note).
 pub fn create_remove_liquidity_note(
     sender: AccountId,
     amm_id: AccountId,
@@ -407,7 +443,7 @@ pub fn create_remove_liquidity_note(
 ) -> Result<Note> {
     let lp_asset =
         FungibleAsset::new(amm_id, lp_amount).context("building LP asset for burn note")?;
-    let storage = liquidity_note_storage(payout, min_x_out, min_y_out);
+    let storage = liquidity_note_storage(sender, payout, min_x_out, min_y_out)?;
     let assets =
         NoteAssets::new(vec![lp_asset.into()]).context("building remove-liquidity note assets")?;
     build_amm_network_note(

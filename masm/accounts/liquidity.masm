@@ -1,9 +1,11 @@
 use miden::protocol::active_account
 use miden::protocol::native_account
 use miden::protocol::active_note
+use miden::protocol::note
 use miden::protocol::output_note
 use miden::protocol::faucet
 use miden::protocol::asset
+use miden::standards::note_tag
 use miden::core::math::u64
 use miden::core::math::u128
 use miden::core::sys
@@ -21,16 +23,19 @@ const LP_SUPPLY_SLOT = word("miden_amm::amm::lp_supply")
 const POOL_X_KEY_SLOT = word("miden_amm::amm::pool_x_key")
 const POOL_Y_KEY_SLOT = word("miden_amm::amm::pool_y_key")
 
+# Payout notes are always private P2ID notes to the SENDER of the consumed note: the
+# recipient is computed in-VM from `active_note::get_sender`, so a liquidity note can
+# never redirect deposits or withdrawals to a third party.
+const NOTE_TYPE_PRIVATE = 0
+
 # Memory layout (word-aligned)
-# Liquidity note storage: [RECIPIENT (4), tag, note_type, min_a, min_b]
+# Liquidity note storage: [PAYOUT_SERIAL_NUM (4), min_a, min_b, pad, pad]
 #   add_liquidity:    min_a = min_lp_out,  min_b = unused
 #   remove_liquidity: min_a = min_x_out,   min_b = min_y_out
 const NOTE_STORAGE_PTR = 0
-const RECIPIENT_PTR = 0
-const TAG_PTR = 4
-const NOTE_TYPE_PTR = 5
-const MIN_A_PTR = 6
-const MIN_B_PTR = 7
+const PAYOUT_SERIAL_PTR = 0
+const MIN_A_PTR = 4
+const MIN_B_PTR = 5
 # Note assets: each asset is ASSET_KEY at +0, ASSET_VALUE at +4 (8 felts per asset)
 const ASSETS_PTR = 16
 const KEY_A_PTR = 16
@@ -54,6 +59,11 @@ const AMOUNT_Y_PTR = 56
 const SQRT_N_MEM = 64
 const SQRT_X0_MEM = 68
 const SQRT_X1_MEM = 72
+# P2ID note storage for the payout note ([sender_suffix, sender_prefix]); word-aligned
+# as required by note::compute_and_store_recipient
+const P2ID_TARGET_PTR = 80
+const P2ID_TARGET_PREFIX_PTR = P2ID_TARGET_PTR + 1
+const PAYOUT_TAG_PTR = 84
 
 # ERRORS
 const ERR_BAD_NOTE_STORAGE = "liquidity note must carry exactly 8 storage elements"
@@ -220,16 +230,41 @@ proc store_lp_supply
     # => []
 end
 
-#! Creates the payout note described by the liquidity note's storage.
-#! Stores the created note index at NOTE_IDX_PTR.
+#! Creates the payout note for the SENDER of the active note: a private P2ID note whose
+#! recipient is computed in-VM from the sender's account ID, with the serial number taken
+#! from the liquidity note's storage. Stores the created note index at NOTE_IDX_PTR.
+#!
+#! The P2ID script root is injected at build time ({p2id_script_root} placeholder).
 #!
 #! Inputs:  []
 #! Outputs: []
-proc create_payout_note
-    padw push.RECIPIENT_PTR mem_loadw_le
+proc create_sender_payout_note
+    # P2ID note storage is [target_suffix, target_prefix]
+    exec.active_note::get_sender
+    # => [sender_suffix, sender_prefix]
+    mem_store.P2ID_TARGET_PTR
+    # => [sender_prefix]
+    dup mem_store.P2ID_TARGET_PREFIX_PTR
+    # => [sender_prefix]
+
+    # tag the payout for the sender
+    exec.note_tag::create_account_target
+    # => [tag]
+    mem_store.PAYOUT_TAG_PTR
+    # => []
+
+    # RECIPIENT = commitment(serial_num, p2id_script, [sender_suffix, sender_prefix])
+    push.{p2id_script_root}
+    # => [P2ID_SCRIPT_ROOT]
+    padw push.PAYOUT_SERIAL_PTR mem_loadw_le
+    # => [SERIAL_NUM, P2ID_SCRIPT_ROOT]
+    push.2 push.P2ID_TARGET_PTR
+    # => [storage_ptr, num_storage_items, SERIAL_NUM, P2ID_SCRIPT_ROOT]
+    exec.note::compute_and_store_recipient
     # => [RECIPIENT]
-    mem_load.NOTE_TYPE_PTR
-    mem_load.TAG_PTR
+
+    push.NOTE_TYPE_PRIVATE
+    mem_load.PAYOUT_TAG_PTR
     # => [tag, note_type, RECIPIENT]
     exec.output_note::create
     # => [note_idx]
@@ -264,18 +299,17 @@ end
 #! an add-liquidity note is active. The note must carry exactly the two pool assets.
 #!
 #! LP tokens are minted directly by this account (the AMM account is the LP faucet) into a
-#! payout note for the recipient encoded in the note storage.
+#! private P2ID payout note for the SENDER of the deposit note (the depositor).
 #!
 #! Uniswap-v2 semantics:
 #!   first deposit:  lp = sqrt(dx * dy) - MIN_LIQUIDITY, supply = sqrt(dx * dy)
 #!   later deposits: lp = min(dx * S / x, dy * S / y),   supply = S + lp
 #!
 #! Liquidity note storage layout (8 felts):
-#!   [0..3] RECIPIENT   P2ID recipient digest for the LP payout note
-#!   [4]    tag         note tag for the payout note
-#!   [5]    note_type   note type for the payout note
-#!   [6]    min_lp_out  slippage bound on minted LP
-#!   [7]    pad
+#!   [0..3] SERIAL_NUM  serial number for the LP payout note
+#!   [4]    min_lp_out  slippage bound on minted LP
+#!   [5]    unused
+#!   [6..7] pad
 #!
 #! Inputs:  []
 #! Outputs: []
@@ -384,8 +418,8 @@ pub proc add_liquidity
     exec.native_account::add_asset dropw
     # => []
 
-    # create the LP payout note and mint the LP tokens straight into it
-    exec.create_payout_note
+    # create the LP payout note (bound to the depositor) and mint the LP straight into it
+    exec.create_sender_payout_note
     mem_load.LP_PTR
     # => [lp]
     exec.faucet::create_fungible_asset
@@ -405,18 +439,18 @@ end
 #! Removes liquidity from the pool. Expects to be invoked (via call) from a note script
 #! while a remove-liquidity note is active. The note must carry exactly one asset: the
 #! pool's own LP token. The LP tokens are burned and the pro-rata share of both pool
-#! assets is paid out into a single note for the recipient encoded in the note storage.
+#! assets is paid out into a single private P2ID note bound to the SENDER of the remove
+#! note — a withdrawal can never be redirected to a third party.
 #!
 #!   amount_x = lp * x / S
 #!   amount_y = lp * y / S
 #!   supply   = S - lp
 #!
 #! Liquidity note storage layout (8 felts):
-#!   [0..3] RECIPIENT   P2ID recipient digest for the payout note
-#!   [4]    tag         note tag for the payout note
-#!   [5]    note_type   note type for the payout note
-#!   [6]    min_x_out   slippage bound on the X payout
-#!   [7]    min_y_out   slippage bound on the Y payout
+#!   [0..3] SERIAL_NUM  serial number for the payout note
+#!   [4]    min_x_out   slippage bound on the X payout
+#!   [5]    min_y_out   slippage bound on the Y payout
+#!   [6..7] pad
 #!
 #! Inputs:  []
 #! Outputs: []
@@ -485,8 +519,8 @@ pub proc remove_liquidity
     exec.store_lp_supply
     # => []
 
-    # pay out both pool assets into a single note
-    exec.create_payout_note
+    # pay out both pool assets into a single note bound to the withdrawer
+    exec.create_sender_payout_note
     push.POOL_X_KEY_MEM mem_load.AMOUNT_X_PTR
     # => [amount_x, pool_x_key_ptr]
     exec.pay_out_pool_asset
